@@ -143,6 +143,12 @@ class ChatCompletionResponse(OpenAIBaseModel):
     # model (``None`` entries for images that were not pruned). ``None``
     # overall when no pruning happened for this request.
     pruned_token_indices: list[list[int] | None] | None = None
+    # HiPrune: full per-image pruning metadata (grid dimensions, token
+    # categories — anchors/buffers/registers/pruned — and mean attention
+    # per category at the object and deep encoder layers). ``None``
+    # entries for unpruned images; ``None`` overall when no pruning
+    # happened for this request.
+    token_pruning_metadata: list[dict[str, Any] | None] | None = None
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -374,7 +380,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "for mm_processor_kwargs={'hiprune_ratio': ...}. Only "
             "supported by models with HiPrune integration (Gemma 4). "
             "The indices of the pruned soft tokens are returned in the "
-            "'pruned_token_indices' response field."
+            "'pruned_token_indices' response field, and full pruning "
+            "statistics (token categories and per-category attention) in "
+            "'token_pruning_metadata'."
         ),
     )
     structured_outputs: StructuredOutputsParams | None = Field(

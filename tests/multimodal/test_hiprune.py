@@ -7,6 +7,7 @@ import torch
 
 from vllm.multimodal.hiprune import (
     aggregate_patch_attention,
+    build_hiprune_metadata,
     compute_retained_tokens_count,
     compute_soft_token_grid,
     hiprune_select,
@@ -129,3 +130,48 @@ def test_full_retention_keeps_everything():
     deep = torch.rand(n_tokens).softmax(dim=0)
     _, _, _, kept = hiprune_select(shallow, deep, n_tokens, grid_w, 1.0)
     assert kept.all()
+
+
+def test_metadata_contents():
+    """Metadata must be JSON-safe and consistent with the selection."""
+    import json
+
+    torch.manual_seed(11)
+    grid_w, grid_h = 15, 18
+    n_tokens = grid_w * grid_h
+    ratio = 0.14
+    shallow = torch.rand(n_tokens).softmax(dim=0)
+    deep = torch.rand(n_tokens).softmax(dim=0)
+
+    anchor, buffer, register, kept = hiprune_select(
+        shallow, deep, n_tokens, grid_w, ratio
+    )
+    md = build_hiprune_metadata(
+        anchor, buffer, register, kept, shallow, deep, grid_w, grid_h, ratio
+    )
+
+    # JSON-serializable (crosses the engine-core process boundary).
+    json.dumps(md)
+
+    assert md["grid"] == [grid_w, grid_h]
+    assert md["num_tokens"] == n_tokens
+    assert md["retention"] == ratio
+
+    # Index sets match the selection exactly.
+    assert md["anchors"] == anchor.tolist()
+    assert md["buffers"] == buffer.tolist()
+    assert md["registers"] == register.tolist()
+    assert sorted(md["pruned"]) == (~kept).nonzero(as_tuple=True)[0].tolist()
+    kept_count = compute_retained_tokens_count(n_tokens, ratio)
+    assert len(md["pruned"]) == n_tokens - kept_count
+
+    # Mean attentions match direct computation.
+    ma = md["mean_attention"]
+    assert ma["object_layer"]["anchor"] == pytest.approx(
+        float(shallow[anchor].mean())
+    )
+    assert ma["deep_layer"]["register"] == pytest.approx(
+        float(deep[register].mean())
+    )
+    # Anchors are the top of the object-layer distribution by construction.
+    assert ma["object_layer"]["anchor"] > ma["object_layer"]["pruned"]

@@ -184,3 +184,58 @@ def hiprune_select(
     kept_mask = selected_mask.clone()
     kept_mask[register_idx] = True
     return anchor_idx, buffer_idx, register_idx, kept_mask
+
+
+def build_hiprune_metadata(
+    anchor_idx: torch.Tensor,
+    buffer_idx: torch.Tensor,
+    register_idx: torch.Tensor,
+    kept_mask: torch.Tensor,
+    shallow_scores: torch.Tensor,
+    deep_scores: torch.Tensor,
+    grid_w: int,
+    grid_h: int,
+    retention: float,
+    object_layer: int = GEMMA4_OBJECT_LAYER,
+    alpha: float = DEFAULT_ALPHA,
+) -> dict[str, object]:
+    """Assemble the JSON-safe per-image pruning metadata for API reporting.
+
+    Mirrors the statistics of the reference Colab visualizer: the token
+    category index sets plus each category's mean attention at the object
+    (middle) and deep (last) encoder layers. Scores are distributions
+    over soft tokens, so a category mean of ``1/num_tokens`` is the
+    uniform baseline.
+    """
+
+    def _mean(scores: torch.Tensor, idx: torch.Tensor) -> float | None:
+        return float(scores[idx].mean()) if idx.numel() else None
+
+    pruned_idx = (~kept_mask).nonzero(as_tuple=True)[0]
+    kept_idx = kept_mask.nonzero(as_tuple=True)[0]
+    categories = {
+        "anchor": anchor_idx,
+        "buffer": buffer_idx,
+        "register": register_idx,
+        "kept": kept_idx,
+        "pruned": pruned_idx,
+    }
+    return {
+        "grid": [grid_w, grid_h],
+        "num_tokens": int(kept_mask.shape[0]),
+        "retention": retention,
+        "object_layer": object_layer,
+        "alpha": alpha,
+        "pruned": pruned_idx.tolist(),
+        "anchors": anchor_idx.tolist(),
+        "buffers": buffer_idx.tolist(),
+        "registers": register_idx.tolist(),
+        "mean_attention": {
+            "object_layer": {
+                name: _mean(shallow_scores, idx) for name, idx in categories.items()
+            },
+            "deep_layer": {
+                name: _mean(deep_scores, idx) for name, idx in categories.items()
+            },
+        },
+    }

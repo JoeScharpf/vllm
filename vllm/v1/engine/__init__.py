@@ -201,9 +201,9 @@ class EngineCoreOutput(
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
 
-    # HiPrune: per-image lists of pruned soft-token indices (None for
-    # unpruned images). Sent at most once per request.
-    pruned_token_indices: list[list[int] | None] | None = None
+    # HiPrune: per-image pruning metadata dicts (None for unpruned
+    # images). Sent at most once per request.
+    token_pruning_metadata: list[dict[str, object] | None] | None = None
 
     @property
     def finished(self) -> bool:

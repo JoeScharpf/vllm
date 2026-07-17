@@ -123,7 +123,7 @@ class RequestOutput:
         *,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
-        pruned_token_indices: list[list[int] | None] | None = None,
+        token_pruning_metadata: list[dict[str, Any] | None] | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -145,10 +145,10 @@ class RequestOutput:
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
         self.ec_transfer_params = ec_transfer_params
-        # HiPrune: per input image, the soft-token indices pruned by the
+        # HiPrune: per input image, the pruning metadata recorded by the
         # model (None entries for unpruned images; None overall when no
         # pruning happened for this request).
-        self.pruned_token_indices = pruned_token_indices
+        self.token_pruning_metadata = token_pruning_metadata
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
@@ -156,8 +156,8 @@ class RequestOutput:
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
         self.ec_transfer_params = next_output.ec_transfer_params
-        if next_output.pruned_token_indices is not None:
-            self.pruned_token_indices = next_output.pruned_token_indices
+        if next_output.token_pruning_metadata is not None:
+            self.token_pruning_metadata = next_output.token_pruning_metadata
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):

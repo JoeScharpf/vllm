@@ -47,6 +47,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.hiprune import (
     GEMMA4_OBJECT_LAYER,
     aggregate_patch_attention,
+    build_hiprune_metadata,
     compute_retained_tokens_count,
     compute_soft_token_grid,
     hiprune_select,
@@ -1250,10 +1251,12 @@ class Gemma4ForConditionalGeneration(
         gen_cfg = vllm_config.model_config.try_get_generation_config()
         self._suppress_token_ids = gen_cfg.get("suppress_tokens") if gen_cfg else None
 
-        # HiPrune bookkeeping: pruned soft-token indices for the items of
-        # the most recent _process_image_input / embed_multimodal call.
-        self._hiprune_pruned_indices: list[list[int] | None] = []
-        self.hiprune_pruned_indices_per_item: list[list[int] | None] = []
+        # HiPrune bookkeeping: per-image pruning metadata (see
+        # build_hiprune_metadata) for the items of the most recent
+        # _process_image_input / embed_multimodal call; None for
+        # unpruned items.
+        self._hiprune_metadata: list[dict[str, object] | None] = []
+        self.hiprune_metadata_per_item: list[dict[str, object] | None] = []
 
     # ------------------------------------------------------------------ #
     # Input parsing
@@ -1472,8 +1475,8 @@ class Gemma4ForConditionalGeneration(
         # free memory per bucket because the previous bucket's encoder
         # pass has already allocated activations we should account for.
         last_hidden_states_map: dict[int, torch.Tensor] = {}
-        # orig_idx -> (shallow_scores, deep_scores, grid_w)
-        hiprune_scores_map: dict[int, tuple[torch.Tensor, torch.Tensor, int]] = {}
+        # orig_idx -> (shallow_scores, deep_scores, grid_w, grid_h)
+        hiprune_scores_map: dict[int, tuple[torch.Tensor, torch.Tensor, int, int]] = {}
         for patches, items in buckets.items():
             free, total = torch.accelerator.get_memory_info()
             max_batch_size = min(
@@ -1544,7 +1547,7 @@ class Gemma4ForConditionalGeneration(
                             kernel_idx,
                             num_soft,
                         )
-                        hiprune_scores_map[orig_idx] = (shallow, deep, grid_w)
+                        hiprune_scores_map[orig_idx] = (shallow, deep, grid_w, grid_h)
                     del attn_by_layer
                 else:
                     encoder_outputs = vt.encoder(
@@ -1560,7 +1563,7 @@ class Gemma4ForConditionalGeneration(
         # Pool per image to strip padding and reduce spatial resolution.
         all_valid_states: list[torch.Tensor] = [None] * total_images  # type: ignore[list-item]
         valid_lens = [0] * total_images
-        pruned_indices: list[list[int] | None] = [None] * total_images
+        hiprune_metadata: list[dict[str, object] | None] = [None] * total_images
 
         for orig_idx in range(total_images):
             chunk_hidden = last_hidden_states_map[orig_idx]
@@ -1583,24 +1586,32 @@ class Gemma4ForConditionalGeneration(
 
             ratio = ratios[orig_idx]
             if ratio is not None:
-                shallow, deep, grid_w = hiprune_scores_map[orig_idx]
+                shallow, deep, grid_w, grid_h = hiprune_scores_map[orig_idx]
                 num_soft = valid_states.shape[0]
                 assert shallow.shape[0] == num_soft, (
                     f"HiPrune score length {shallow.shape[0]} != pooled "
                     f"soft-token count {num_soft}"
                 )
-                _, _, _, kept_mask = hiprune_select(
+                anchor_idx, buffer_idx, register_idx, kept_mask = hiprune_select(
                     shallow, deep, num_soft, grid_w, ratio
                 )
                 valid_states = valid_states[kept_mask]
-                pruned_indices[orig_idx] = (
-                    (~kept_mask).nonzero(as_tuple=True)[0].tolist()
+                hiprune_metadata[orig_idx] = build_hiprune_metadata(
+                    anchor_idx,
+                    buffer_idx,
+                    register_idx,
+                    kept_mask,
+                    shallow,
+                    deep,
+                    grid_w,
+                    grid_h,
+                    ratio,
                 )
 
             all_valid_states[orig_idx] = valid_states
             valid_lens[orig_idx] = valid_states.shape[0]
 
-        self._hiprune_pruned_indices = pruned_indices
+        self._hiprune_metadata = hiprune_metadata
 
         # Project all images in a single batched call.
         flat_valid_states = torch.cat(all_valid_states, dim=0).to(self.model_dtype)
@@ -1765,11 +1776,11 @@ class Gemma4ForConditionalGeneration(
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         multimodal_embeddings: list[torch.Tensor] = []
-        # Per returned item: soft-token indices pruned by HiPrune (None
-        # when the item was not pruned). The model runner reads this
-        # right after embed_multimodal to cache the indices alongside
-        # the encoder outputs.
-        pruned_per_item: list[list[int] | None] = []
+        # Per returned item: HiPrune metadata (None when the item was not
+        # pruned). The model runner reads this right after
+        # embed_multimodal to cache the metadata alongside the encoder
+        # outputs.
+        metadata_per_item: list[dict[str, object] | None] = []
 
         for modality, multimodal_input in mm_input_by_modality.items():
             if multimodal_input is None:
@@ -1777,17 +1788,17 @@ class Gemma4ForConditionalGeneration(
             if modality == "image":
                 image_embeddings = self._process_image_input(multimodal_input)
                 multimodal_embeddings.extend(image_embeddings)
-                pruned_per_item.extend(self._hiprune_pruned_indices)
+                metadata_per_item.extend(self._hiprune_metadata)
             elif modality == "video":
                 video_embeddings = self._process_video_input(multimodal_input)
                 multimodal_embeddings.extend(video_embeddings)
-                pruned_per_item.extend([None] * len(video_embeddings))
+                metadata_per_item.extend([None] * len(video_embeddings))
             elif modality == "audio":
                 audio_embeddings = self._process_audio_input(multimodal_input)
                 multimodal_embeddings.extend(audio_embeddings)
-                pruned_per_item.extend([None] * len(audio_embeddings))
+                metadata_per_item.extend([None] * len(audio_embeddings))
 
-        self.hiprune_pruned_indices_per_item = pruned_per_item
+        self.hiprune_metadata_per_item = metadata_per_item
         return multimodal_embeddings
 
     def embed_input_ids(
