@@ -50,6 +50,14 @@ Responses carry two pruning fields:
    - `overlay.report.txt` — human-readable summary of the answer, token
      counts, category breakdown, and mean attention per category
 
+   To compare against an unpruned run, send the same request without
+   `token_pruning`, save it, and pass it as a fourth argument — the
+   report then shows the baseline and pruned answers side by side:
+
+   ```bash
+   python3 visualize_pruned.py image.jpg response.json overlay.png baseline.json
+   ```
+
 ## Example output
 
 `pruned_overlay.png` was produced from a real serving run at

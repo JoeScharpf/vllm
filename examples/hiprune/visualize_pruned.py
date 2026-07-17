@@ -16,8 +16,12 @@ next to it:
 - <output>.metadata.jsonl — one compact line per image (batch-friendly)
 - <output>.report.txt — a human-readable summary of answer + statistics
 
+If a baseline response (same request without token_pruning) is given as
+a fourth argument, the report shows the baseline and pruned answers
+side by side.
+
 Usage:
-    python3 visualize_pruned.py <image> <response.json> <output.png>
+    python3 visualize_pruned.py <image> <response.json> <output.png> [baseline.json]
 """
 
 import json
@@ -55,7 +59,14 @@ def gemma_grid(width: int, height: int) -> tuple[int, int]:
     return grid_w, grid_h
 
 
-def write_reports(resp: dict, out_path: str) -> list[str]:
+def extract_answer(resp: dict) -> str:
+    choices = resp.get("choices") or []
+    if not choices:
+        return ""
+    return ((choices[0].get("message") or {}).get("content") or "").strip()
+
+
+def write_reports(resp: dict, out_path: str, baseline: dict | None = None) -> list[str]:
     """Write pretty/JSONL metadata and a plain-text report next to the
     overlay. Returns the list of files written."""
     stem = Path(out_path).with_suffix("")
@@ -75,13 +86,21 @@ def write_reports(resp: dict, out_path: str) -> list[str]:
                 f.write(json.dumps({"image": i, **(md or {})}) + "\n")
         written.append(jsonl_path)
 
-    answer = ""
-    choices = resp.get("choices") or []
-    if choices:
-        answer = (choices[0].get("message") or {}).get("content") or ""
     usage = resp.get("usage") or {}
 
-    lines = [f"answer      : {answer.strip()}", ""]
+    lines: list[str] = []
+    if baseline is not None:
+        lines += ["=== BASELINE ANSWER (no pruning) ===", extract_answer(baseline), ""]
+        b_usage = baseline.get("usage") or {}
+        if b_usage:
+            lines.append(
+                f"tokens      : prompt {b_usage.get('prompt_tokens')} | "
+                f"completion {b_usage.get('completion_tokens')}"
+            )
+        lines += ["", "=== PRUNED ANSWER ==="]
+        lines += [extract_answer(resp), ""]
+    else:
+        lines += [f"answer      : {extract_answer(resp)}", ""]
     if usage:
         lines.append(
             f"tokens      : prompt {usage.get('prompt_tokens')} | "
@@ -120,6 +139,10 @@ def write_reports(resp: dict, out_path: str) -> list[str]:
 
 def main() -> None:
     image_path, resp_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+    baseline = None
+    if len(sys.argv) > 4:
+        with open(sys.argv[4]) as f:
+            baseline = json.load(f)
 
     img = Image.open(image_path).convert("RGB")
     with open(resp_path) as f:
@@ -189,7 +212,7 @@ def main() -> None:
               {k: (round(v, 6) if v is not None else None)
                for k, v in ma["deep_layer"].items()})
 
-    for path in write_reports(resp, out_path):
+    for path in write_reports(resp, out_path, baseline):
         print(f"wrote {path}")
 
 
