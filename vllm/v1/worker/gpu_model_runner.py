@@ -248,6 +248,9 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
+# Max entries in the persistent HiPrune pruned-indices cache (FIFO).
+_HIPRUNE_INDICES_CACHE_CAP = 4096
+
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
@@ -490,6 +493,12 @@ class GPUModelRunner(
         # Set to True after init_routed_experts_capturer() completes.
         # Prevents routed experts code from running during profiling/dummy run.
         self.routed_experts_initialized = False
+        # HiPrune: per-image pruning metadata per encoded mm item, keyed by
+        # mm_hash (persistent so encoder/prefix cache hits can still report
+        # them; entries are deterministic for a given image + ratio).
+        self.hiprune_metadata_cache: dict[str, dict[str, object]] = {}
+        # Requests whose pruning metadata was already attached to an output.
+        self._hiprune_reported_reqs: set[str] = set()
         self.max_model_len = model_config.max_model_len
 
         # Always set to false after the first forward pass
@@ -1175,6 +1184,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._hiprune_reported_reqs.discard(req_id)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -3077,12 +3087,26 @@ class GPUModelRunner(
                 )
 
         encoder_outputs: list[torch.Tensor] = []
+        # HiPrune: pruning metadata per encoded item (aligned with
+        # encoder_outputs / mm_hashes); None for unpruned items.
+        # NOTE: `model` may be a CUDAGraphWrapper whose __getattr__ only
+        # forwards reads; writing through it would create a shadowing
+        # attribute on the wrapper. Always use the unwrapped model for
+        # the HiPrune attribute handoff.
+        raw_model = self.get_model()
+        metadata_per_item: list[dict[str, object] | None] = []
         # Track the current index in mm_kwargs/mm_lora_refs to map groups to request IDs
         current_item_idx = 0
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
             mm_kwargs, device=self.device, pin_memory=PIN_MEMORY
         ):
             batch_outputs: MultiModalEmbeddings
+
+            # HiPrune: clear stale per-item metadata so paths that bypass
+            # embed_multimodal (e.g. cudagraph replay) cannot leak the
+            # previous call's metadata into this group.
+            if hasattr(raw_model, "hiprune_metadata_per_item"):
+                raw_model.hiprune_metadata_per_item = []
 
             # EVS and dynamic res video related change.
             # (ekhvedchenia): Temporary hack to limit peak memory usage when
@@ -3154,15 +3178,77 @@ class GPUModelRunner(
             sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
             encoder_outputs.extend(batch_outputs)
 
+            # HiPrune: the model records pruning metadata for the items of
+            # its most recent embed_multimodal call. The length guard
+            # skips paths that bypassed embed_multimodal (cudagraph
+            # replay) where the attribute would be stale.
+            item_metadata = getattr(raw_model, "hiprune_metadata_per_item", None)
+            if item_metadata is not None and len(item_metadata) == num_items:
+                metadata_per_item.extend(item_metadata)
+            else:
+                metadata_per_item.extend([None] * num_items)
+
             current_item_idx += num_items
 
         # Cache the encoder outputs by mm_hash
-        for mm_hash, output in zip(mm_hashes, encoder_outputs):
+        for mm_hash, output, item_md in zip(
+            mm_hashes, encoder_outputs, metadata_per_item
+        ):
             self.encoder_cache[mm_hash] = output
+            if item_md is not None:
+                # Bounded FIFO: evict the oldest entry so the persistent
+                # metadata cache cannot grow without limit.
+                while len(self.hiprune_metadata_cache) >= _HIPRUNE_INDICES_CACHE_CAP:
+                    self.hiprune_metadata_cache.pop(
+                        next(iter(self.hiprune_metadata_cache))
+                    )
+                self.hiprune_metadata_cache[mm_hash] = item_md
             logger.debug("Finish execute for mm hash %s", mm_hash)
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
         return encoder_outputs
+
+    def _collect_hiprune_metadata(
+        self, req_ids: list[str]
+    ) -> dict[str, list[dict[str, object] | None]] | None:
+        """Report HiPrune pruning metadata per request, once.
+
+        For each not-yet-reported request in this step's output that has
+        image features with cached pruning metadata, returns a mapping of
+        req_id -> per-image metadata dicts (None for unpruned images).
+        The lookup is by mm_hash, so requests served from the encoder or
+        prefix cache still report as long as the item was pruned-encoded
+        by this runner at some point.
+        """
+        if not self.hiprune_metadata_cache:
+            return None
+        report: dict[str, list[dict[str, object] | None]] = {}
+        for req_id in req_ids:
+            if req_id in self._hiprune_reported_reqs:
+                continue
+            req_state = self.requests.get(req_id)
+            if req_state is None or not req_state.mm_features:
+                continue
+            image_features = [f for f in req_state.mm_features if f.modality == "image"]
+            # Only images whose kwargs carry a hiprune_ratio are expected
+            # to produce metadata. With chunked prefill the images of one
+            # request may be encoded across several steps, so wait until
+            # every expected image has a cache entry before reporting
+            # (the report is sent only once per request).
+            expected = [
+                f.identifier
+                for f in image_features
+                if f.data is not None and "hiprune_ratio" in f.data
+            ]
+            if not expected:
+                continue
+            if all(h in self.hiprune_metadata_cache for h in expected):
+                report[req_id] = [
+                    self.hiprune_metadata_cache.get(f.identifier)
+                    for f in image_features
+                ]
+                self._hiprune_reported_reqs.add(req_id)
+        return report or None
 
     def _gather_mm_embeddings(
         self,
@@ -4709,6 +4795,9 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                token_pruning_metadata=self._collect_hiprune_metadata(
+                    req_ids_output_copy
+                ),
             )
 
         if not self.use_async_scheduling:

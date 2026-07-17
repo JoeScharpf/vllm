@@ -1065,6 +1065,17 @@ class OpenAIServingChat(GenerateBaseServing):
             kv_transfer_params=final_res.kv_transfer_params,
             ec_transfer_params=final_res.ec_transfer_params,
             metrics=per_request_metrics,
+            # Compact per-image pruned index lists, derived from the full
+            # metadata for backward compatibility.
+            pruned_token_indices=(
+                [
+                    md["pruned"] if md is not None else None
+                    for md in final_res.token_pruning_metadata
+                ]
+                if final_res.token_pruning_metadata is not None
+                else None
+            ),
+            token_pruning_metadata=final_res.token_pruning_metadata,
         )
 
         # Log complete response if output logging is enabled

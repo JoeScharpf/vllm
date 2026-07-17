@@ -178,6 +178,10 @@ class RequestState:
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
 
+        # HiPrune: per-image pruning metadata (sent once by the engine
+        # core; attached to every subsequent RequestOutput).
+        self.token_pruning_metadata: list[dict[str, object] | None] | None = None
+
         # Stream Interval
         self.stream_interval = stream_interval
         self.sent_tokens_offset = 0  # Offset of sent tokens
@@ -378,6 +382,7 @@ class RequestState:
             ec_transfer_params=ec_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
+            token_pruning_metadata=self.token_pruning_metadata,
         )
 
     def _new_completion_output(
@@ -632,6 +637,10 @@ class OutputProcessor:
             if engine_core_output.routed_experts is not None:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
+                )
+            if engine_core_output.token_pruning_metadata is not None:
+                req_state.token_pruning_metadata = (
+                    engine_core_output.token_pruning_metadata
                 )
 
             if req_state.is_prefilling:

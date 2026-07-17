@@ -1812,6 +1812,13 @@ class Scheduler(SchedulerInterface):
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
+            # HiPrune: stash pruning metadata on the request until an
+            # EngineCoreOutput is actually emitted for it (the report may
+            # arrive during chunked prefill, before any token is sampled).
+            runner_pruned = model_runner_output.token_pruning_metadata
+            if runner_pruned is not None and req_id in runner_pruned:
+                request.token_pruning_metadata = runner_pruned[req_id]
+
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if (
@@ -1821,6 +1828,10 @@ class Scheduler(SchedulerInterface):
                 or ec_transfer_params
                 or stopped
             ):
+                # Emit pruning metadata once, on the first output.
+                token_pruning_metadata = request.token_pruning_metadata
+                request.token_pruning_metadata = None
+
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -1838,6 +1849,7 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        token_pruning_metadata=token_pruning_metadata,
                     )
                 )
             else:
