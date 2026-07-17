@@ -60,6 +60,24 @@ Responses carry two pruning fields:
        --baseline baseline.json --request request.json
    ```
 
+## Latency benchmark
+
+`benchmark.py` sweeps `token_pruning` ratios over the same image and
+prompt using streaming requests, measuring per ratio the prefill/TTFT
+(includes the vision encoder), decode tok/s, and total time. It decodes
+greedily (`temperature 0`) so answers are comparable across ratios, and
+sets a random `cache_salt` per request so the prefix cache never hides
+the prefill cost:
+
+```bash
+python3 benchmark.py image.jpg --prompt "Describe this image." \
+    --url http://localhost:8000 --ratios 1.0 0.5 0.3 0.14 \
+    --max-tokens 100 --out timing.json
+```
+
+Pass the resulting `timing.json` to `visualize_pruned.py --timing` to
+append the latency table to the report.
+
 ## Example output
 
 `pruned_overlay.png` was produced from a real serving run at

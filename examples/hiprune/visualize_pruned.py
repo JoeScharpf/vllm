@@ -22,10 +22,13 @@ Optional flags enrich the report:
   token_pruning; the report then shows both answers side by side
 - --request request.json — the request body that was sent; the report
   then starts with the prompt and the request settings
+- --timing timing.json — output of benchmark.py; the report then ends
+  with a latency table (prefill/TTFT, decode tok/s, total per ratio)
 
 Usage:
     python3 visualize_pruned.py <image> <response.json> <output.png> \
-        [--baseline baseline.json] [--request request.json]
+        [--baseline baseline.json] [--request request.json] \
+        [--timing timing.json]
 """
 
 import argparse
@@ -82,11 +85,32 @@ def extract_prompt(request: dict) -> str:
     return " ".join(p for p in parts if p).strip()
 
 
+def timing_lines(timing: dict) -> list[str]:
+    """Format benchmark.py output as a report section."""
+    lines = ["", "=== LATENCY (from benchmark.py, streaming) ==="]
+    header = (f"{'retention':>10} {'prompt tok':>11} {'prefill/TTFT':>13} "
+              f"{'decode tok/s':>13} {'total':>8}")
+    lines += [header, "-" * len(header)]
+    for r in timing.get("results", []):
+        label = "baseline" if r["retention"] >= 1.0 else f"{r['retention']:.2f}"
+        lines.append(
+            f"{label:>10} {r['prompt_tokens']:>11} "
+            f"{r['ttft_s']:>12.3f}s {r['decode_tok_s']:>13.1f} "
+            f"{r['total_s']:>7.2f}s"
+        )
+    lines.append(
+        "note: TTFT includes the vision encoder and network latency "
+        "(identical across rows); compare TTFT and decode tok/s, not totals."
+    )
+    return lines
+
+
 def write_reports(
     resp: dict,
     out_path: str,
     baseline: dict | None = None,
     request: dict | None = None,
+    timing: dict | None = None,
 ) -> list[str]:
     """Write pretty/JSONL metadata and a plain-text report next to the
     overlay. Returns the list of files written."""
@@ -160,6 +184,8 @@ def write_reports(
                 f"{k} {v:.4g}" for k, v in ma.items() if v is not None
             )
             lines.append(f"  mean attention ({layer.replace('_', ' ')}): {cells}")
+    if timing is not None:
+        lines += timing_lines(timing)
     report_path = f"{stem}.report.txt"
     with open(report_path, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -178,6 +204,7 @@ def main() -> None:
     )
     parser.add_argument("--baseline", help="baseline (unpruned) response JSON")
     parser.add_argument("--request", help="request body JSON that was sent")
+    parser.add_argument("--timing", help="benchmark.py output JSON")
     args = parser.parse_args()
 
     image_path, resp_path, out_path = args.image, args.response, args.output
@@ -190,6 +217,10 @@ def main() -> None:
     if args.request:
         with open(args.request) as f:
             request = json.load(f)
+    timing = None
+    if args.timing:
+        with open(args.timing) as f:
+            timing = json.load(f)
 
     img = Image.open(image_path).convert("RGB")
     with open(resp_path) as f:
@@ -259,7 +290,7 @@ def main() -> None:
               {k: (round(v, 6) if v is not None else None)
                for k, v in ma["deep_layer"].items()})
 
-    for path in write_reports(resp, out_path, baseline, request):
+    for path in write_reports(resp, out_path, baseline, request, timing):
         print(f"wrote {path}")
 
 
