@@ -1,9 +1,17 @@
 # HiPrune demo: visualize pruned patches from a served response
 
-`visualize_pruned.py` renders the `pruned_token_indices` returned by a
-vLLM server running Gemma 4 with HiPrune (see the `token_pruning` request
-field) as an overlay on the original image: pruned 48x48 px cells are
-darkened, kept cells are outlined in green.
+`visualize_pruned.py` renders the pruning data returned by a vLLM server
+running Gemma 4 with HiPrune (see the `token_pruning` request field) as
+an overlay on the original image: pruned 48x48 px cells are darkened and
+kept cells are outlined by HiPrune category — anchors (red), buffers
+(orange), registers (green).
+
+Responses carry two pruning fields:
+
+- `pruned_token_indices` — per image, the soft-token indices dropped.
+- `token_pruning_metadata` — per image, the full statistics: grid
+  dimensions, anchor/buffer/register/pruned index sets, and mean
+  attention per category at the object and deep encoder layers.
 
 ## Usage
 
@@ -38,7 +46,8 @@ darkened, kept cells are outlined in green.
 ## Example output
 
 `pruned_overlay.png` was produced from a real serving run at
-`token_pruning: 0.14`: 232 of 270 soft tokens pruned, 38 kept, and the
-model still answered "Golden Retriever".
+`token_pruning: 0.14`: 232 of 270 soft tokens pruned, 38 kept (1 anchor,
+4 buffers, 33 registers), and the model still answered "Golden
+Retriever".
 
 ![example overlay](pruned_overlay.png)
