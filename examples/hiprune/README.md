@@ -78,6 +78,40 @@ python3 benchmark.py image.jpg --prompt "Describe this image." \
 Pass the resulting `timing.json` to `visualize_pruned.py --timing` to
 append the latency table to the report.
 
+## Accuracy benchmark (POPE)
+
+`pope_eval.py` measures the accuracy/speed tradeoff on POPE (yes/no
+object-hallucination questions on COCO images, from `lmms-lab/POPE` on
+Hugging Face). It runs a balanced subset at several ratios with greedy
+decoding, scores by yes/no matching, and logs per-request results
+(JSONL) plus per-ratio aggregates. `plot_pope.py` turns the summary
+into accuracy-vs-retention and accuracy-vs-TTFT charts.
+
+```bash
+pip install datasets pillow
+python3 pope_eval.py --url http://localhost:8000 --num-samples 400 \
+    --ratios 1.0 0.5 0.3 0.14 --concurrency 8 --out-dir ./pope_out
+python3 plot_pope.py ./pope_out/pope_summary.json
+```
+
+Results from a 396-sample run on an A6000 (`google/gemma-4-e4b-it`):
+
+| retention | accuracy | F1    | mean prompt tokens | mean TTFT |
+|-----------|----------|-------|--------------------|-----------|
+| baseline  | 0.866    | 0.860 | 286.9              | 0.113s    |
+| 0.50      | 0.851    | 0.842 | 155.5              | 0.151s    |
+| 0.30      | 0.846    | 0.837 | 103.1              | 0.141s    |
+| 0.14      | 0.773    | 0.741 | 60.7               | 0.135s    |
+
+Accuracy holds within ~2 points down to 0.3 retention, then drops
+sharply at 0.14 (adversarial questions degrade first). Note the TTFT
+column: on small, previously unseen images the pruned rows are *slower*
+— the eager-attention capture pass in the vision encoder costs more
+than the LLM-prefill saving when images are only ~280 soft tokens.
+Pruning pays off in prompt length (KV-cache footprint, batching
+capacity) at all ratios, and in TTFT only for repeated or token-heavy
+inputs.
+
 ## Example output
 
 `pruned_overlay.png` was produced from a real serving run at
