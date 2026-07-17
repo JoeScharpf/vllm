@@ -9,12 +9,20 @@ Prefers the `token_pruning_metadata` response field (which carries the
 grid and token categories); falls back to `pruned_token_indices` (kept
 cells all green, grid reconstructed from the image size).
 
+Alongside the overlay (<output>.png), also writes readable artifacts
+next to it:
+
+- <output>.metadata.json — the pruning metadata, pretty-printed
+- <output>.metadata.jsonl — one compact line per image (batch-friendly)
+- <output>.report.txt — a human-readable summary of answer + statistics
+
 Usage:
     python3 visualize_pruned.py <image> <response.json> <output.png>
 """
 
 import json
 import sys
+from pathlib import Path
 
 from PIL import Image, ImageDraw
 
@@ -45,6 +53,69 @@ def gemma_grid(width: int, height: int) -> tuple[int, int]:
         else:
             grid_h -= 1
     return grid_w, grid_h
+
+
+def write_reports(resp: dict, out_path: str) -> list[str]:
+    """Write pretty/JSONL metadata and a plain-text report next to the
+    overlay. Returns the list of files written."""
+    stem = Path(out_path).with_suffix("")
+    all_md = resp.get("token_pruning_metadata") or []
+    written: list[str] = []
+
+    if any(md is not None for md in all_md):
+        pretty_path = f"{stem}.metadata.json"
+        with open(pretty_path, "w") as f:
+            json.dump(all_md, f, indent=2)
+            f.write("\n")
+        written.append(pretty_path)
+
+        jsonl_path = f"{stem}.metadata.jsonl"
+        with open(jsonl_path, "w") as f:
+            for i, md in enumerate(all_md):
+                f.write(json.dumps({"image": i, **(md or {})}) + "\n")
+        written.append(jsonl_path)
+
+    answer = ""
+    choices = resp.get("choices") or []
+    if choices:
+        answer = (choices[0].get("message") or {}).get("content") or ""
+    usage = resp.get("usage") or {}
+
+    lines = [f"answer      : {answer.strip()}", ""]
+    if usage:
+        lines.append(
+            f"tokens      : prompt {usage.get('prompt_tokens')} | "
+            f"completion {usage.get('completion_tokens')}"
+        )
+    for i, md in enumerate(all_md):
+        if md is None:
+            lines.append(f"image {i}     : not pruned")
+            continue
+        n = md["num_tokens"]
+        n_pruned = len(md["pruned"])
+        n_kept = n - n_pruned
+        lines += [
+            f"image {i}",
+            f"  grid      : {md['grid'][0]} x {md['grid'][1]}  ({n} soft tokens)",
+            f"  retention : {md['retention']:.4f}  "
+            f"(object layer {md['object_layer']}, alpha {md['alpha']})",
+            f"  kept      : {n_kept} ({100 * n_kept / n:.1f}%)   "
+            f"pruned: {n_pruned} ({100 * n_pruned / n:.1f}%)",
+            f"    anchors   : {len(md['anchors'])}  {md['anchors']}",
+            f"    buffers   : {len(md['buffers'])}  {md['buffers']}",
+            f"    registers : {len(md['registers'])}",
+        ]
+        for layer in ("object_layer", "deep_layer"):
+            ma = md["mean_attention"][layer]
+            cells = " | ".join(
+                f"{k} {v:.4g}" for k, v in ma.items() if v is not None
+            )
+            lines.append(f"  mean attention ({layer.replace('_', ' ')}): {cells}")
+    report_path = f"{stem}.report.txt"
+    with open(report_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    written.append(report_path)
+    return written
 
 
 def main() -> None:
@@ -117,6 +188,9 @@ def main() -> None:
         print("mean attention (deep layer)  :",
               {k: (round(v, 6) if v is not None else None)
                for k, v in ma["deep_layer"].items()})
+
+    for path in write_reports(resp, out_path):
+        print(f"wrote {path}")
 
 
 if __name__ == "__main__":

@@ -43,6 +43,13 @@ Responses carry two pruning fields:
    python3 visualize_pruned.py image.jpg response.json overlay.png
    ```
 
+   Alongside `overlay.png` this also writes readable artifacts:
+
+   - `overlay.metadata.json` — the pruning metadata, pretty-printed
+   - `overlay.metadata.jsonl` — one compact line per image (batch-friendly)
+   - `overlay.report.txt` — human-readable summary of the answer, token
+     counts, category breakdown, and mean attention per category
+
 ## Example output
 
 `pruned_overlay.png` was produced from a real serving run at
