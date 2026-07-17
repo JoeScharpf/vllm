@@ -16,16 +16,20 @@ next to it:
 - <output>.metadata.jsonl — one compact line per image (batch-friendly)
 - <output>.report.txt — a human-readable summary of answer + statistics
 
-If a baseline response (same request without token_pruning) is given as
-a fourth argument, the report shows the baseline and pruned answers
-side by side.
+Optional flags enrich the report:
+
+- --baseline baseline.json — the same request sent without
+  token_pruning; the report then shows both answers side by side
+- --request request.json — the request body that was sent; the report
+  then starts with the prompt and the request settings
 
 Usage:
-    python3 visualize_pruned.py <image> <response.json> <output.png> [baseline.json]
+    python3 visualize_pruned.py <image> <response.json> <output.png> \
+        [--baseline baseline.json] [--request request.json]
 """
 
+import argparse
 import json
-import sys
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -66,7 +70,24 @@ def extract_answer(resp: dict) -> str:
     return ((choices[0].get("message") or {}).get("content") or "").strip()
 
 
-def write_reports(resp: dict, out_path: str, baseline: dict | None = None) -> list[str]:
+def extract_prompt(request: dict) -> str:
+    """Pull the text parts out of the request messages (skipping images)."""
+    parts: list[str] = []
+    for msg in request.get("messages") or []:
+        content = msg.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            parts += [p.get("text", "") for p in content if p.get("type") == "text"]
+    return " ".join(p for p in parts if p).strip()
+
+
+def write_reports(
+    resp: dict,
+    out_path: str,
+    baseline: dict | None = None,
+    request: dict | None = None,
+) -> list[str]:
     """Write pretty/JSONL metadata and a plain-text report next to the
     overlay. Returns the list of files written."""
     stem = Path(out_path).with_suffix("")
@@ -89,6 +110,15 @@ def write_reports(resp: dict, out_path: str, baseline: dict | None = None) -> li
     usage = resp.get("usage") or {}
 
     lines: list[str] = []
+    if request is not None:
+        lines.append(f"prompt      : {extract_prompt(request)}")
+        settings = [f"model {request['model']}"] if "model" in request else []
+        for key in ("max_tokens", "token_pruning", "temperature"):
+            if key in request:
+                settings.append(f"{key} {request[key]}")
+        if settings:
+            lines.append(f"settings    : {' | '.join(settings)}")
+        lines.append("")
     if baseline is not None:
         lines += ["=== BASELINE ANSWER (no pruning) ===", extract_answer(baseline), ""]
         b_usage = baseline.get("usage") or {}
@@ -138,11 +168,28 @@ def write_reports(resp: dict, out_path: str, baseline: dict | None = None) -> li
 
 
 def main() -> None:
-    image_path, resp_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("image", help="original image sent in the request")
+    parser.add_argument("response", help="pruned chat completion response JSON")
+    parser.add_argument("output", help="overlay PNG to write")
+    parser.add_argument(
+        "baseline_pos", nargs="?", default=None,
+        help="(deprecated positional) same as --baseline",
+    )
+    parser.add_argument("--baseline", help="baseline (unpruned) response JSON")
+    parser.add_argument("--request", help="request body JSON that was sent")
+    args = parser.parse_args()
+
+    image_path, resp_path, out_path = args.image, args.response, args.output
     baseline = None
-    if len(sys.argv) > 4:
-        with open(sys.argv[4]) as f:
+    baseline_path = args.baseline or args.baseline_pos
+    if baseline_path:
+        with open(baseline_path) as f:
             baseline = json.load(f)
+    request = None
+    if args.request:
+        with open(args.request) as f:
+            request = json.load(f)
 
     img = Image.open(image_path).convert("RGB")
     with open(resp_path) as f:
@@ -212,7 +259,7 @@ def main() -> None:
               {k: (round(v, 6) if v is not None else None)
                for k, v in ma["deep_layer"].items()})
 
-    for path in write_reports(resp, out_path, baseline):
+    for path in write_reports(resp, out_path, baseline, request):
         print(f"wrote {path}")
 
 
