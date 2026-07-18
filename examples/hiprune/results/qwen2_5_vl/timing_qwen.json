@@ -1,0 +1,43 @@
+{
+  "prompt": "Describe this image in detail.",
+  "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "max_tokens": 100,
+  "results": [
+    {
+      "ttft_s": 1.5465582758188248,
+      "decode_tok_s": 86.29223288738658,
+      "total_s": 2.693922405131161,
+      "prompt_tokens": 16251,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramid of Giza, one of the Seven Wonders of the Ancient World. The pyramid is constructed from large stone blocks and stands prominently against a clear blue sky. The structure is composed of multiple levels, with the topmost level being the smallest and the base level being the largest. The pyramid's surface is smooth and well-preserved, showcasing the meticulous craftsmanship of ancient Egyptian builders.\n\nIn the foreground, there is a sandy desert landscape, which contrasts sharply with the imposing stone",
+      "retention": 1.0
+    },
+    {
+      "ttft_s": 6.983451643027365,
+      "decode_tok_s": 89.39913863117935,
+      "total_s": 8.090940410271287,
+      "prompt_tokens": 8139,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramid of Giza, one of the Seven Wonders of the Ancient World. The pyramid is constructed from large stone blocks and stands prominently against a clear blue sky. The structure is composed of multiple levels, each decreasing in size as it ascends to the apex. The pyramid's surface is smooth and well-preserved, showcasing the meticulous craftsmanship of ancient Egyptian builders.\n\nIn the foreground, there is a sandy desert landscape with some rocky outcrops. A few people can be",
+      "retention": 0.5
+    },
+    {
+      "ttft_s": 6.693225791677833,
+      "decode_tok_s": 91.60985610930564,
+      "total_s": 7.7739835428074,
+      "prompt_tokens": 4894,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramid of Giza, one of the Seven Wonders of the Ancient World. The pyramid is constructed from large stone blocks and stands prominently against a clear blue sky. The structure is composed of multiple levels, with the topmost level being the smallest and the base level being the largest. The pyramid's surface is smooth and well-preserved, showcasing the meticulous craftsmanship of ancient Egyptian builders.\n\nIn the foreground, there are several people and horses, indicating that the site is open to",
+      "retention": 0.3
+    },
+    {
+      "ttft_s": 6.521784051321447,
+      "decode_tok_s": 92.34562001744236,
+      "total_s": 7.593936732970178,
+      "prompt_tokens": 2298,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramid of Giza, one of the Seven Wonders of the Ancient World. The pyramid is constructed from large stone blocks and stands prominently against a clear blue sky. The structure has a distinctive shape with a broad base that narrows as it ascends to a sharp, pointed apex. \n\nIn the foreground, there are several people and horses, indicating that the site is open to visitors. The desert landscape surrounding the pyramid is vast and sandy, with a few scattered rocks and",
+      "retention": 0.14
+    }
+  ]
+}

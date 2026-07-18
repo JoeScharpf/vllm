@@ -1,0 +1,43 @@
+{
+  "prompt": "Describe this image in detail.",
+  "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "max_tokens": 100,
+  "results": [
+    {
+      "ttft_s": 0.30057908222079277,
+      "decode_tok_s": 91.84433113606258,
+      "total_s": 1.3785897297784686,
+      "prompt_tokens": 4083,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramids of Giza, an iconic archaeological complex located in Egypt. The pyramids are constructed from large stone blocks and are situated on a flat plain known as the Giza Plateau. The most prominent pyramid in the image is the Great Pyramid of Khufu, also known as the Pyramid of Cheops. This pyramid is the largest of the three and stands at approximately 146.5 meters (481 feet) tall.\n\nTo the left of the",
+      "retention": 1.0
+    },
+    {
+      "ttft_s": 0.8893385650590062,
+      "decode_tok_s": 92.66325527361921,
+      "total_s": 1.9578869361430407,
+      "prompt_tokens": 2055,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramids of Giza, an iconic archaeological complex located in Egypt. The pyramids are constructed from large stone blocks and are arranged in a triangular formation. The largest pyramid is the Great Pyramid of Khufu, also known as the Pyramid of Cheops, which is the oldest and largest of the three. It stands at approximately 146.6 meters (481 feet) tall and was built around 2560 BC.\n\nTo the left of",
+      "retention": 0.5
+    },
+    {
+      "ttft_s": 0.8350659105926752,
+      "decode_tok_s": 93.06123868116954,
+      "total_s": 1.8990537049248815,
+      "prompt_tokens": 1244,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramids of Giza, one of the most iconic and ancient structures in the world. The pyramids are located in the Giza Plateau, which is part of the Giza Necropolis in Egypt. The three main pyramids visible in the image are:\n\n1. **Great Pyramid of Giza**: This is the largest of the three pyramids and was built for Pharaoh Khufu (also known as Cheops). It stands at an impressive height of",
+      "retention": 0.3
+    },
+    {
+      "ttft_s": 0.7972851181402802,
+      "decode_tok_s": 93.15061484763663,
+      "total_s": 1.8602489894255996,
+      "prompt_tokens": 595,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramid of Giza, one of the Seven Wonders of the Ancient World, located in Egypt. The pyramid is constructed from large stone blocks and stands prominently against a clear blue sky. The structure is composed of multiple levels, with the topmost level being the smallest and the base being the largest. The pyramid's surface shows signs of erosion and weathering, typical of ancient stone structures exposed to the elements for thousands of years.\n\nIn the foreground, there are several people and",
+      "retention": 0.14
+    }
+  ]
+}

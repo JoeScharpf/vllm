@@ -1,0 +1,21 @@
+prompt      : What breed of dog is this and what is it holding?
+settings    : model Qwen/Qwen2.5-VL-3B-Instruct | max_tokens 60 | token_pruning 0.25 | temperature 0
+
+=== BASELINE ANSWER (no pruning) ===
+The puppy in the picture appears to be a Golden Retriever. Golden Retrievers are known for their friendly and gentle nature, which is evident in this image. The puppy is not holding anything; it is simply sitting on a moss-covered log.
+
+tokens      : prompt 1019 | completion 51
+
+=== PRUNED ANSWER ===
+The puppy in the picture appears to be a Golden Retriever. Golden Retrievers are known for their friendly and gentle demeanor, which is evident in this image. The puppy is not holding anything; it is simply sitting on a moss-covered log.
+
+tokens      : prompt 279 | completion 51
+image 0
+  grid      : 29 x 34  (986 soft tokens)
+  retention : 0.2500  (object layer 16, alpha 0.1)
+  kept      : 246 (24.9%)   pruned: 740 (75.1%)
+    anchors   : 5  [246, 245, 811, 638, 609]
+    buffers   : 16  [216, 217, 244, 247, 274, 275, 580, 608, 610, 637, 639, 667, 782, 810, 812, 840]
+    registers : 225
+  mean attention (object layer): anchor 0.0008772 | buffer 0.0003954 | register 0.000286 | kept 0.0003051 | pruned 0.0002364
+  mean attention (deep layer): anchor 0.0002948 | buffer 0.0002084 | register 0.0005634 | kept 0.0005349 | pruned 0.00016
