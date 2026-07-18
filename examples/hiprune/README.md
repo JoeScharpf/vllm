@@ -11,9 +11,37 @@ Qwen2.5-VL.
 Responses carry two pruning fields:
 
 - `pruned_token_indices` — per image, the soft-token indices dropped.
-- `token_pruning_metadata` — per image, the full statistics: grid
-  dimensions, anchor/buffer/register/pruned index sets, and mean
-  attention per category at the object and deep encoder layers.
+- `token_pruning_metadata` — per image, the full statistics: the
+  `method` (`hiprune` or `hydart`), grid dimensions, the kept index
+  sets by category, and mean attention per category. HiPrune reports
+  anchor/buffer/register sets with object- and deep-layer attention;
+  HyDART reports anchor/buffer/diverse sets with object-layer
+  attention plus cosine-similarity statistics (each diverse token's
+  redundancy at selection time, and each pruned token's final max
+  similarity to the kept set).
+
+## HyDART (Qwen2.5-VL)
+
+Set `HIPRUNE_METHOD=hydart` in the server environment to replace
+HiPrune's deep-layer register stage with a greedy
+maximal-marginal-relevance (MMR) loop over the merged visual
+embeddings (DART-style duplication avoidance, arXiv 2502.11494).
+Anchors and buffers are selected exactly as HiPrune does; the rest of
+the budget maximizes `attn_hat − λ_seed·r_seed − λ_pick·r_pick`, where
+`r_seed` is the max cosine similarity to the anchor+buffer set and
+`r_pick` to the already-picked diverse tokens. Because no deep-layer
+attention is needed, the second dense O(S²) score capture — the
+dominant selection cost on large images — is skipped.
+
+```bash
+HIPRUNE_METHOD=hydart HYDART_LAMBDA_SEED=0.1 HYDART_LAMBDA_PICK=0.5 \
+    vllm serve Qwen/Qwen2.5-VL-3B-Instruct --max-model-len 32768 --enable-hiprune
+```
+
+`HYDART_LAMBDA_SEED` (default 0.1) and `HYDART_LAMBDA_PICK` (default
+0.5) tune the two penalties; both at 0 reduces the diverse stage to an
+attention top-k. The per-request API is unchanged (`token_pruning` is
+still just the keep-ratio).
 
 ## Usage
 

@@ -24,6 +24,15 @@ The method exploits the hierarchical attention inside the vision encoder:
 
 Everything else is pruned before the tokens reach the language model.
 
+This module also implements **HyDART** (:func:`hydart_select`), a hybrid
+variant selectable via ``HIPRUNE_METHOD=hydart``: anchors and buffers are
+selected exactly as HiPrune does, but the remainder of the budget is
+filled by a greedy maximal-marginal-relevance (MMR) loop over the visual
+embeddings the language model consumes (DART-style duplication avoidance,
+arXiv 2502.11494) instead of deep-layer registers. This removes the
+second dense attention-score capture — the dominant selection cost on
+large images — since only the object layer is needed.
+
 Split of responsibilities (mirrors EVS in ``vllm/multimodal/evs.py``):
 
 - The multimodal processor calls :func:`compute_retained_tokens_count` to
@@ -37,6 +46,7 @@ Split of responsibilities (mirrors EVS in ``vllm/multimodal/evs.py``):
   the invariant that keeps the prompt and the encoder output consistent.
 """
 
+import os
 from collections.abc import Mapping
 
 import torch
@@ -51,6 +61,41 @@ GEMMA4_OBJECT_LAYER = 8
 # (HIPRUNE_OBJECT_LAYER=16); the deep layer is the last (32nd) block.
 QWEN2_5_VL_OBJECT_LAYER = 16
 DEFAULT_ALPHA = 0.1
+
+# HyDART MMR penalties (see hydart_select). lambda_seed penalizes
+# resembling the anchor+buffer seed set (keep small: the object is already
+# partially kept, resembling it should not be a death sentence);
+# lambda_pick penalizes resembling already-picked diverse tokens (keep
+# larger: near-duplicates add nothing).
+DEFAULT_HYDART_LAMBDA_SEED = 0.1
+DEFAULT_HYDART_LAMBDA_PICK = 0.5
+# Above this token count the greedy loop switches to block picks (top-k
+# per round) to bound the number of sequential GPU steps.
+HYDART_BLOCK_THRESHOLD = 2048
+HYDART_BLOCK_SIZE = 8
+
+
+def get_hiprune_method() -> str:
+    """Selection method for ``--enable-hiprune`` servers.
+
+    ``HIPRUNE_METHOD=hiprune`` (default) or ``hydart``. Read from the
+    environment at call time so one env var switches the whole server;
+    the per-request ``token_pruning`` field stays a plain keep-ratio.
+    """
+    method = os.environ.get("HIPRUNE_METHOD", "hiprune").lower()
+    if method not in ("hiprune", "hydart"):
+        raise ValueError(
+            f"HIPRUNE_METHOD must be 'hiprune' or 'hydart', got {method!r}"
+        )
+    return method
+
+
+def get_hydart_lambdas() -> tuple[float, float]:
+    """(lambda_seed, lambda_pick) from env, with paper-Colab defaults."""
+    return (
+        float(os.environ.get("HYDART_LAMBDA_SEED", DEFAULT_HYDART_LAMBDA_SEED)),
+        float(os.environ.get("HYDART_LAMBDA_PICK", DEFAULT_HYDART_LAMBDA_PICK)),
+    )
 
 
 def get_hiprune_ratio(merged_kwargs: Mapping[str, object]) -> float | None:
@@ -252,6 +297,200 @@ def hiprune_select(
     return anchor_idx, buffer_idx, register_idx, kept_mask
 
 
+def hydart_select(
+    shallow_scores: torch.Tensor,
+    embeddings: torch.Tensor,
+    num_tokens: int,
+    grid_w: int,
+    pruning_ratio: float,
+    alpha: float = DEFAULT_ALPHA,
+    lambda_seed: float = DEFAULT_HYDART_LAMBDA_SEED,
+    lambda_pick: float = DEFAULT_HYDART_LAMBDA_PICK,
+    block_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """HyDART: HiPrune anchors/buffers + greedy-MMR diverse fill.
+
+    Anchors and buffers use the exact HiPrune arithmetic (see
+    :func:`hiprune_select`); the remaining budget is filled one pick (or
+    one block of picks) at a time, maximizing
+
+        attn_hat - lambda_seed * r_seed - lambda_pick * r_pick
+
+    where ``attn_hat`` is the object-layer attention min-max normalized to
+    [0, 1], ``r_seed`` is each token's max cosine similarity to the
+    anchor+buffer seed set (fixed), and ``r_pick`` is its max cosine
+    similarity to the diverse tokens picked so far (updated after every
+    pick). Similarities are clamped to [0, 1] so negative similarity is
+    never a bonus. No deep-layer scores are needed, which removes the
+    second dense attention capture HiPrune requires.
+
+    Keeps exactly ``compute_retained_tokens_count(num_tokens,
+    pruning_ratio)`` tokens, the same invariant as :func:`hiprune_select`
+    (guaranteed by an assert on the seed-set size).
+
+    Args:
+        shallow_scores: ``(num_tokens,)`` soft-token scores from the
+            object (middle) encoder layer.
+        embeddings: ``(num_tokens, hidden)`` merged visual embeddings in
+            the same (raster) token order as ``shallow_scores`` — the
+            tensors the language model would consume. Any float dtype;
+            similarity math runs in float32.
+        num_tokens: total soft tokens for the image.
+        grid_w: soft-token grid width (for spatial buffer neighbors).
+        pruning_ratio: retention ratio in ``(0, 1]``.
+        alpha: fraction of the budget allotted to anchors.
+        lambda_seed: penalty weight for similarity to anchors+buffers.
+        lambda_pick: penalty weight for similarity to prior diverse picks.
+        block_size: picks per greedy round. ``None`` picks 1 at a time up
+            to ``HYDART_BLOCK_THRESHOLD`` tokens and ``HYDART_BLOCK_SIZE``
+            beyond, bounding sequential GPU steps on large images. Within
+            a block, similarities are not updated (slightly coarser
+            selection, same invariants).
+
+    Returns:
+        ``(anchor_idx, buffer_idx, diverse_idx, kept_mask, sim_stats)``.
+        ``sim_stats[i]`` is: for diverse tokens, redundancy at selection
+        time (low = the pick added novel content); for pruned tokens, the
+        final max cosine similarity to the full kept set (high = well
+        covered); 1.0 for anchors/buffers.
+    """
+    budget = compute_retained_tokens_count(num_tokens, pruning_ratio)
+    shallow_token_num = round((budget * alpha) / 5)
+
+    anchor_idx = torch.topk(shallow_scores, k=shallow_token_num).indices
+    shallow_all = torch.cat(
+        [
+            anchor_idx,
+            anchor_idx - 1,
+            anchor_idx + 1,
+            anchor_idx - grid_w,
+            anchor_idx + grid_w,
+        ]
+    )
+    shallow_all = shallow_all.clamp(0, num_tokens - 1)
+    shallow_all = torch.unique(shallow_all, sorted=False)
+    buffer_idx = shallow_all[~torch.isin(shallow_all, anchor_idx)]
+
+    assert shallow_all.shape[0] <= budget, (
+        f"anchors+buffers ({shallow_all.shape[0]}) exceed the keep budget "
+        f"({budget}); lower alpha or raise the retention ratio"
+    )
+
+    if block_size is None:
+        block_size = 1 if num_tokens <= HYDART_BLOCK_THRESHOLD else HYDART_BLOCK_SIZE
+
+    emb = torch.nn.functional.normalize(embeddings.float(), dim=-1)
+    attn = shallow_scores.float()
+    attn_hat = (attn - attn.min()) / (attn.max() - attn.min()).clamp_min(1e-12)
+
+    if shallow_all.numel():
+        r_seed = (emb @ emb[shallow_all].T).max(dim=-1).values.clamp_(0.0, 1.0)
+    else:
+        # Zero anchors (tiny budget * alpha): the whole budget goes to
+        # diverse picks, mirroring hiprune_select's behavior where topk(0)
+        # hands the full budget to registers.
+        r_seed = torch.zeros(num_tokens, device=emb.device)
+    r_pick = torch.zeros_like(r_seed)
+    base_score = attn_hat - lambda_seed * r_seed
+
+    blocked = torch.zeros(num_tokens, dtype=torch.bool, device=emb.device)
+    blocked[shallow_all] = True
+
+    diverse_num = budget - int(shallow_all.shape[0])
+    pick_chunks: list[torch.Tensor] = []
+    redundancy_chunks: list[torch.Tensor] = []
+    remaining = diverse_num
+    while remaining > 0:
+        k = min(block_size, remaining)
+        score = base_score - lambda_pick * r_pick
+        score[blocked] = float("-inf")
+        idx = torch.topk(score, k=k).indices
+        pick_chunks.append(idx)
+        # Redundancy at selection time (block granularity).
+        redundancy_chunks.append(torch.maximum(r_seed[idx], r_pick[idx]))
+        blocked[idx] = True
+        sim_new = (emb @ emb[idx].T).max(dim=-1).values.clamp_(0.0, 1.0)
+        r_pick = torch.maximum(r_pick, sim_new)
+        remaining -= k
+    if pick_chunks:
+        diverse_idx = torch.cat(pick_chunks)
+        diverse_redundancy = torch.cat(redundancy_chunks)
+    else:
+        diverse_idx = torch.empty(0, dtype=anchor_idx.dtype, device=emb.device)
+        diverse_redundancy = torch.empty(0, device=emb.device)
+
+    kept_mask = torch.zeros(num_tokens, dtype=torch.bool, device=emb.device)
+    kept_mask[shallow_all] = True
+    kept_mask[diverse_idx] = True
+
+    sim_stats = torch.maximum(r_seed, r_pick)  # final max sim to kept set
+    sim_stats[shallow_all] = 1.0
+    if diverse_idx.numel():
+        sim_stats[diverse_idx] = diverse_redundancy
+    return anchor_idx, buffer_idx, diverse_idx, kept_mask, sim_stats
+
+
+def build_hydart_metadata(
+    anchor_idx: torch.Tensor,
+    buffer_idx: torch.Tensor,
+    diverse_idx: torch.Tensor,
+    kept_mask: torch.Tensor,
+    shallow_scores: torch.Tensor,
+    sim_stats: torch.Tensor,
+    grid_w: int,
+    grid_h: int,
+    retention: float,
+    object_layer: int,
+    alpha: float = DEFAULT_ALPHA,
+    lambda_seed: float = DEFAULT_HYDART_LAMBDA_SEED,
+    lambda_pick: float = DEFAULT_HYDART_LAMBDA_PICK,
+) -> dict[str, object]:
+    """JSON-safe per-image HyDART metadata for API reporting.
+
+    Mirrors :func:`build_hiprune_metadata`, with the register category
+    replaced by ``diverse`` and deep-layer attention replaced by cosine
+    similarity statistics: diverse tokens report their redundancy at
+    selection time (low = novel content), pruned tokens their final max
+    similarity to the kept set (high = well covered by kept tokens).
+    """
+
+    def _mean(scores: torch.Tensor, idx: torch.Tensor) -> float | None:
+        return float(scores[idx].mean()) if idx.numel() else None
+
+    pruned_idx = (~kept_mask).nonzero(as_tuple=True)[0]
+    kept_idx = kept_mask.nonzero(as_tuple=True)[0]
+    categories = {
+        "anchor": anchor_idx,
+        "buffer": buffer_idx,
+        "diverse": diverse_idx,
+        "kept": kept_idx,
+        "pruned": pruned_idx,
+    }
+    return {
+        "method": "hydart",
+        "grid": [grid_w, grid_h],
+        "num_tokens": int(kept_mask.shape[0]),
+        "retention": retention,
+        "object_layer": object_layer,
+        "alpha": alpha,
+        "lambda_seed": lambda_seed,
+        "lambda_pick": lambda_pick,
+        "pruned": pruned_idx.tolist(),
+        "anchors": anchor_idx.tolist(),
+        "buffers": buffer_idx.tolist(),
+        "diverse": diverse_idx.tolist(),
+        "mean_attention": {
+            "object_layer": {
+                name: _mean(shallow_scores, idx) for name, idx in categories.items()
+            },
+        },
+        "similarity": {
+            "diverse_at_selection": _mean(sim_stats, diverse_idx),
+            "pruned_vs_kept": _mean(sim_stats, pruned_idx),
+        },
+    }
+
+
 def build_hiprune_metadata(
     anchor_idx: torch.Tensor,
     buffer_idx: torch.Tensor,
@@ -287,6 +526,7 @@ def build_hiprune_metadata(
         "pruned": pruned_idx,
     }
     return {
+        "method": "hiprune",
         "grid": [grid_w, grid_h],
         "num_tokens": int(kept_mask.shape[0]),
         "retention": retention,

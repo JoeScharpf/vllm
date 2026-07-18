@@ -1,0 +1,14 @@
+POPE accuracy-vs-speed | Qwen/Qwen2.5-VL-3B-Instruct | 396 balanced samples
+
+ retention  accuracy      f1  yes-rate  invalid  prompt tok  mean TTFT
+----------------------------------------------------------------------
+  baseline     0.884   0.875     0.429        0       385.6     0.083s
+      0.50     0.856   0.846     0.402        9       209.9     0.084s
+      0.30     0.841   0.839     0.396       16       139.7     0.038s
+      0.14     0.765   0.780     0.348       35        83.4     0.036s
+
+per-category accuracy:
+    baseline: adversarial 0.848 | popular 0.909 | random 0.894
+        0.50: adversarial 0.818 | popular 0.894 | random 0.856
+        0.30: adversarial 0.788 | popular 0.879 | random 0.856
+        0.14: adversarial 0.780 | popular 0.765 | random 0.750

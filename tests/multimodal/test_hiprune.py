@@ -9,11 +9,14 @@ from vllm.multimodal.hiprune import (
     QWEN2_5_VL_OBJECT_LAYER,
     aggregate_patch_attention,
     build_hiprune_metadata,
+    build_hydart_metadata,
     compute_retained_tokens_count,
     compute_soft_token_grid,
     fold_merged_token_scores,
+    get_hiprune_method,
     get_hiprune_ratio,
     hiprune_select,
+    hydart_select,
 )
 
 POOL_K = 3
@@ -395,3 +398,246 @@ def test_recompute_mrope_keeps_original_positions_for_kept_tokens(keep_every):
     text_start = positions[:, prefix_len + n_kept]
     expected_text_start = int(mm_pos[3, 0]) + base
     assert (text_start == expected_text_start).all()
+
+
+# --------------------------------------------------------------------------
+# HyDART (HIPRUNE_METHOD=hydart)
+# --------------------------------------------------------------------------
+
+
+def _clustered_embeddings(
+    n_tokens: int, dim: int, n_clusters: int, generator: torch.Generator
+) -> torch.Tensor:
+    """Embeddings with heavy duplication: tokens are noisy copies of a few
+    cluster centers, the regime HyDART's diversity stage targets."""
+    centers = torch.randn(n_clusters, dim, generator=generator)
+    assignment = torch.randint(0, n_clusters, (n_tokens,), generator=generator)
+    noise = 0.05 * torch.randn(n_tokens, dim, generator=generator)
+    return centers[assignment] + noise
+
+
+def _mean_pairwise_sim(emb: torch.Tensor, idx: torch.Tensor) -> float:
+    e = torch.nn.functional.normalize(emb[idx].float(), dim=-1)
+    sims = e @ e.T
+    off_diag = sims[~torch.eye(len(idx), dtype=torch.bool)]
+    return float(off_diag.mean())
+
+
+@pytest.mark.parametrize("seed", range(10))
+@pytest.mark.parametrize("ratio", [0.11, 0.25, 0.5])
+def test_hydart_invariants(seed: int, ratio: float):
+    g = torch.Generator().manual_seed(seed)
+    grid_w, grid_h = 12, 9
+    n_tokens = grid_w * grid_h
+    shallow = torch.rand(n_tokens, generator=g).softmax(dim=0)
+    emb = _clustered_embeddings(n_tokens, 32, 6, g)
+
+    anchor, buffer, diverse, kept, sim_stats = hydart_select(
+        shallow, emb, n_tokens, grid_w, ratio
+    )
+
+    # Exact budget: the count the processor promised via placeholders.
+    assert kept.sum().item() == compute_retained_tokens_count(n_tokens, ratio)
+
+    # Categories are disjoint and jointly equal the kept set.
+    all_idx = torch.cat([anchor, buffer, diverse])
+    assert all_idx.unique().numel() == all_idx.numel()
+    mask_from_cats = torch.zeros(n_tokens, dtype=torch.bool)
+    mask_from_cats[all_idx] = True
+    assert torch.equal(mask_from_cats, kept)
+
+    # Anchors and buffers are byte-identical to HiPrune's seed stage.
+    deep_dummy = torch.rand(n_tokens, generator=g).softmax(dim=0)
+    hp_anchor, hp_buffer, _, _ = hiprune_select(
+        shallow, deep_dummy, n_tokens, grid_w, ratio
+    )
+    assert torch.equal(anchor, hp_anchor)
+    assert set(buffer.tolist()) == set(hp_buffer.tolist())
+
+    # sim_stats semantics: seeds pinned at 1.0, everything in [0, 1].
+    assert (sim_stats[anchor] == 1.0).all()
+    assert (sim_stats[buffer] == 1.0).all()
+    assert sim_stats.min() >= 0.0 and sim_stats.max() <= 1.0
+
+
+def test_hydart_lambda_zero_is_attention_topk():
+    """With both penalties off, diverse picks are exactly the attention
+    top-k over non-seed tokens (HiPrune's register stage but with
+    object-layer scores)."""
+    g = torch.Generator().manual_seed(0)
+    grid_w = 12
+    n_tokens = grid_w * 9
+    # Distinct scores so top-k is unambiguous under ties.
+    shallow = torch.randperm(n_tokens, generator=g).float() / n_tokens
+    emb = _clustered_embeddings(n_tokens, 32, 6, g)
+
+    anchor, buffer, diverse, kept, _ = hydart_select(
+        shallow, emb, n_tokens, grid_w, 0.3, lambda_seed=0.0, lambda_pick=0.0
+    )
+    seed_mask = torch.zeros(n_tokens, dtype=torch.bool)
+    seed_mask[torch.cat([anchor, buffer])] = True
+    masked = shallow.clone()
+    masked[seed_mask] = float("-inf")
+    expected = torch.topk(masked, k=diverse.numel()).indices
+    assert set(diverse.tolist()) == set(expected.tolist())
+
+
+def test_hydart_deterministic():
+    g = torch.Generator().manual_seed(7)
+    n_tokens, grid_w = 260, 20
+    shallow = torch.rand(n_tokens, generator=g).softmax(dim=0)
+    emb = _clustered_embeddings(n_tokens, 32, 6, g)
+    first = hydart_select(shallow, emb, n_tokens, grid_w, 0.14)
+    second = hydart_select(shallow, emb, n_tokens, grid_w, 0.14)
+    for a, b in zip(first, second):
+        assert torch.equal(a, b)
+
+
+def test_hydart_full_retention_keeps_everything():
+    g = torch.Generator().manual_seed(3)
+    n_tokens, grid_w = 255, 15
+    shallow = torch.rand(n_tokens, generator=g).softmax(dim=0)
+    emb = _clustered_embeddings(n_tokens, 32, 6, g)
+    _, _, _, kept, _ = hydart_select(shallow, emb, n_tokens, grid_w, 1.0)
+    assert kept.all()
+
+
+def test_hydart_zero_anchor_budget():
+    """A budget small enough that round(budget * alpha / 5) == 0 must fill
+    the whole budget with diverse picks, not crash on an empty seed set."""
+    g = torch.Generator().manual_seed(1)
+    grid_w = 6
+    n_tokens = grid_w * 6
+    shallow = torch.rand(n_tokens, generator=g).softmax(dim=0)
+    emb = _clustered_embeddings(n_tokens, 16, 4, g)
+
+    ratio = 0.12  # budget 4 -> shallow_token_num = round(0.08) = 0
+    anchor, buffer, diverse, kept, _ = hydart_select(
+        shallow, emb, n_tokens, grid_w, ratio
+    )
+    assert anchor.numel() == 0 and buffer.numel() == 0
+    assert diverse.numel() == kept.sum().item()
+    assert kept.sum().item() == compute_retained_tokens_count(n_tokens, ratio)
+
+
+def test_hydart_over_budget_seed_asserts():
+    """Anchors+buffers exceeding the budget must fail loudly instead of
+    silently violating the placeholder count."""
+    g = torch.Generator().manual_seed(2)
+    grid_w = 10
+    n_tokens = grid_w * 10
+    shallow = torch.rand(n_tokens, generator=g).softmax(dim=0)
+    emb = _clustered_embeddings(n_tokens, 16, 4, g)
+    with pytest.raises(AssertionError, match="exceed the keep budget"):
+        hydart_select(shallow, emb, n_tokens, grid_w, 0.1, alpha=5.0)
+
+
+def test_hydart_lambda_pick_reduces_redundancy():
+    """Raising lambda_pick must not increase the mean pairwise cosine
+    similarity of the diverse set (the redundancy it penalizes)."""
+    g = torch.Generator().manual_seed(4)
+    grid_w = 16
+    n_tokens = grid_w * 12
+    shallow = torch.rand(n_tokens, generator=g).softmax(dim=0)
+    emb = _clustered_embeddings(n_tokens, 32, 5, g)
+
+    _, _, div_lo, _, _ = hydart_select(
+        shallow, emb, n_tokens, grid_w, 0.25, lambda_seed=0.0, lambda_pick=0.0
+    )
+    _, _, div_hi, _, _ = hydart_select(
+        shallow, emb, n_tokens, grid_w, 0.25, lambda_seed=0.0, lambda_pick=2.0
+    )
+    assert _mean_pairwise_sim(emb, div_hi) <= _mean_pairwise_sim(emb, div_lo) + 1e-6
+
+
+@pytest.mark.parametrize("block_size", [4, 16])
+def test_hydart_block_greedy_invariants(block_size: int):
+    """Block picks (large-image fast path) keep every invariant: exact
+    budget, disjoint categories, no duplicate picks."""
+    g = torch.Generator().manual_seed(5)
+    grid_w = 20
+    n_tokens = grid_w * 15
+    shallow = torch.rand(n_tokens, generator=g).softmax(dim=0)
+    emb = _clustered_embeddings(n_tokens, 32, 8, g)
+
+    anchor, buffer, diverse, kept, sim_stats = hydart_select(
+        shallow, emb, n_tokens, grid_w, 0.3, block_size=block_size
+    )
+    assert kept.sum().item() == compute_retained_tokens_count(n_tokens, 0.3)
+    all_idx = torch.cat([anchor, buffer, diverse])
+    assert all_idx.unique().numel() == all_idx.numel()
+
+    # With lambda_pick=0 the loop is one-shot, so block picks must match
+    # single picks exactly (r_pick never enters the score).
+    _, _, div_blocked, _, _ = hydart_select(
+        shallow, emb, n_tokens, grid_w, 0.3, lambda_pick=0.0, block_size=block_size
+    )
+    _, _, div_single, _, _ = hydart_select(
+        shallow, emb, n_tokens, grid_w, 0.3, lambda_pick=0.0, block_size=1
+    )
+    assert set(div_blocked.tolist()) == set(div_single.tolist())
+
+
+def test_hydart_metadata_contents():
+    """HyDART metadata must be JSON-safe and consistent with the selection."""
+    import json
+
+    g = torch.Generator().manual_seed(11)
+    grid_w, grid_h = 15, 18
+    n_tokens = grid_w * grid_h
+    ratio = 0.14
+    shallow = torch.rand(n_tokens, generator=g).softmax(dim=0)
+    emb = _clustered_embeddings(n_tokens, 32, 6, g)
+
+    anchor, buffer, diverse, kept, sim_stats = hydart_select(
+        shallow, emb, n_tokens, grid_w, ratio
+    )
+    md = build_hydart_metadata(
+        anchor,
+        buffer,
+        diverse,
+        kept,
+        shallow,
+        sim_stats,
+        grid_w,
+        grid_h,
+        ratio,
+        object_layer=QWEN2_5_VL_OBJECT_LAYER,
+        lambda_seed=0.1,
+        lambda_pick=0.5,
+    )
+    json.dumps(md)
+
+    assert md["method"] == "hydart"
+    assert md["grid"] == [grid_w, grid_h]
+    assert md["num_tokens"] == n_tokens
+    assert md["retention"] == ratio
+    assert md["object_layer"] == QWEN2_5_VL_OBJECT_LAYER
+    assert md["lambda_seed"] == 0.1 and md["lambda_pick"] == 0.5
+    assert md["anchors"] == anchor.tolist()
+    assert md["buffers"] == buffer.tolist()
+    assert md["diverse"] == diverse.tolist()
+    assert sorted(md["pruned"]) == (~kept).nonzero(as_tuple=True)[0].tolist()
+    kept_count = compute_retained_tokens_count(n_tokens, ratio)
+    assert len(md["pruned"]) == n_tokens - kept_count
+
+    ma = md["mean_attention"]["object_layer"]
+    assert ma["anchor"] == pytest.approx(float(shallow[anchor].mean()))
+    assert "deep_layer" not in md["mean_attention"]
+    sim = md["similarity"]
+    assert sim["diverse_at_selection"] == pytest.approx(
+        float(sim_stats[diverse].mean())
+    )
+    assert 0.0 <= sim["pruned_vs_kept"] <= 1.0
+
+
+def test_get_hiprune_method_env(monkeypatch):
+    monkeypatch.delenv("HIPRUNE_METHOD", raising=False)
+    assert get_hiprune_method() == "hiprune"
+    monkeypatch.setenv("HIPRUNE_METHOD", "hydart")
+    assert get_hiprune_method() == "hydart"
+    monkeypatch.setenv("HIPRUNE_METHOD", "HyDART")
+    assert get_hiprune_method() == "hydart"
+    monkeypatch.setenv("HIPRUNE_METHOD", "bogus")
+    with pytest.raises(ValueError):
+        get_hiprune_method()

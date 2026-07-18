@@ -76,9 +76,13 @@ from vllm.multimodal.evs import (
 from vllm.multimodal.hiprune import (
     QWEN2_5_VL_OBJECT_LAYER,
     build_hiprune_metadata,
+    build_hydart_metadata,
     fold_merged_token_scores,
+    get_hiprune_method,
     get_hiprune_ratio,
+    get_hydart_lambdas,
     hiprune_select,
+    hydart_select,
 )
 from vllm.multimodal.hiprune import (
     compute_retained_tokens_count as hiprune_retained_tokens_count,
@@ -1734,15 +1738,27 @@ class Qwen2_5_VLForConditionalGeneration(
         images — and because the dense score pass has a much higher memory
         cost than the windowed encoder attention.
 
-        For each pruned image, the anchor/buffer/register selection keeps
-        exactly ``compute_retained_tokens_count(num_tokens, ratio)`` merged
-        tokens — the same count the processor used for the placeholder run
-        — and the kept-token mask and metadata are stashed for
+        For each pruned image, the selection (HiPrune's
+        anchor/buffer/register or, with ``HIPRUNE_METHOD=hydart``, HyDART's
+        anchor/buffer/diverse) keeps exactly
+        ``compute_retained_tokens_count(num_tokens, ratio)`` merged tokens
+        — the same count the processor used for the placeholder run — and
+        the kept-token mask and metadata are stashed for
         _postprocess_image_embeds_evs and the API layer respectively.
+
+        HyDART only captures the object layer: the deep-layer register
+        stage is replaced by cosine-similarity MMR over the merged
+        embeddings, so the second dense score pass (the dominant selection
+        cost on large images) is skipped entirely.
         """
         merge_size = self.visual.spatial_merge_size
         object_layer_idx = QWEN2_5_VL_OBJECT_LAYER - 1
         deep_layer_idx = len(self.visual.blocks) - 1
+        method = get_hiprune_method()
+        if method == "hydart":
+            capture_layer_idxs: tuple[int, ...] = (object_layer_idx,)
+        else:
+            capture_layer_idxs = (object_layer_idx, deep_layer_idx)
 
         patch_counts = [t * h * w for t, h, w in grid_thw_list]
         pixel_values_per_image = pixel_values.split(patch_counts)
@@ -1758,10 +1774,9 @@ class Qwen2_5_VLForConditionalGeneration(
             embeds, scores_by_layer = self.visual.forward_capturing_hiprune_scores(
                 pv,
                 [thw],
-                capture_layer_idxs=(object_layer_idx, deep_layer_idx),
+                capture_layer_idxs=capture_layer_idxs,
             )
             shallow = scores_by_layer[object_layer_idx]
-            deep = scores_by_layer[deep_layer_idx]
 
             t, h, w = thw
             grid_h = h // merge_size
@@ -1769,23 +1784,53 @@ class Qwen2_5_VLForConditionalGeneration(
             num_tokens = t * grid_h * grid_w
             assert embeds.shape[0] == num_tokens == shallow.shape[0]
 
-            anchor_idx, buffer_idx, register_idx, kept_mask = hiprune_select(
-                shallow, deep, num_tokens, grid_w, ratio
-            )
+            if method == "hydart":
+                lambda_seed, lambda_pick = get_hydart_lambdas()
+                anchor_idx, buffer_idx, diverse_idx, kept_mask, sim_stats = (
+                    hydart_select(
+                        shallow,
+                        embeds,
+                        num_tokens,
+                        grid_w,
+                        ratio,
+                        lambda_seed=lambda_seed,
+                        lambda_pick=lambda_pick,
+                    )
+                )
+                metadata = build_hydart_metadata(
+                    anchor_idx,
+                    buffer_idx,
+                    diverse_idx,
+                    kept_mask,
+                    shallow,
+                    sim_stats,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    object_layer=QWEN2_5_VL_OBJECT_LAYER,
+                    lambda_seed=lambda_seed,
+                    lambda_pick=lambda_pick,
+                )
+            else:
+                deep = scores_by_layer[deep_layer_idx]
+                anchor_idx, buffer_idx, register_idx, kept_mask = hiprune_select(
+                    shallow, deep, num_tokens, grid_w, ratio
+                )
+                metadata = build_hiprune_metadata(
+                    anchor_idx,
+                    buffer_idx,
+                    register_idx,
+                    kept_mask,
+                    shallow,
+                    deep,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    object_layer=QWEN2_5_VL_OBJECT_LAYER,
+                )
             image_embeds_out.append(embeds[kept_mask])
             self._hiprune_kept_masks[idx] = kept_mask
-            self._hiprune_metadata[idx] = build_hiprune_metadata(
-                anchor_idx,
-                buffer_idx,
-                register_idx,
-                kept_mask,
-                shallow,
-                deep,
-                grid_w,
-                grid_h,
-                ratio,
-                object_layer=QWEN2_5_VL_OBJECT_LAYER,
-            )
+            self._hiprune_metadata[idx] = metadata
 
         return tuple(image_embeds_out)
 
