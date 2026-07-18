@@ -50,6 +50,7 @@ from vllm.multimodal.hiprune import (
     build_hiprune_metadata,
     compute_retained_tokens_count,
     compute_soft_token_grid,
+    get_hiprune_ratio as _get_hiprune_ratio,
     hiprune_select,
 )
 from vllm.multimodal.inputs import (
@@ -151,32 +152,6 @@ def _shrink_image_token_runs(
             run_start = None
 
     return ids[keep].unsqueeze(0)
-
-
-def _get_hiprune_ratio(merged_kwargs: Mapping[str, object]) -> float | None:
-    """Extract and validate the HiPrune retention ratio from mm kwargs.
-
-    The ratio is the fraction of image soft tokens KEPT (e.g. 0.14 keeps
-    14%). ``None`` or ``1.0`` disables pruning. Passed per-request via
-    ``mm_processor_kwargs={"hiprune_ratio": ...}`` (or the ``token_pruning``
-    chat-completions field, which maps onto it).
-    """
-    val = merged_kwargs.get("hiprune_ratio")
-    if val is None:
-        return None
-    ratio = float(val)
-    if not 0.0 < ratio <= 1.0:
-        raise ValueError(
-            f"hiprune_ratio must be in (0, 1], got {ratio}. It is the "
-            "fraction of image tokens to KEEP."
-        )
-    if ratio == 1.0:
-        return None
-    # Quantize to float32: the ratio travels to the model in a float32
-    # tensor, and compute_retained_tokens_count rounds, so the processor
-    # must use the exact same bits or the placeholder count can differ
-    # from the model's kept-token count near half-integer boundaries.
-    return float(torch.tensor(ratio, dtype=torch.float32).item())
 
 
 # ---------------------------------------------------------------------------

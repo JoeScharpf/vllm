@@ -4,8 +4,13 @@
 
 Implements the token selection method from "HiPrune: Training-Free Visual
 Token Pruning via Hierarchical Attention in Vision-Language Models"
-(https://arxiv.org/abs/2508.00553) for image inputs, adapted to encoders
-that pool patches into soft tokens (Gemma 4).
+(https://arxiv.org/abs/2508.00553) for image inputs. Two encoder families
+are supported:
+
+- Encoders that pool patches into soft tokens (Gemma 4): see
+  :func:`compute_soft_token_grid` / :func:`aggregate_patch_attention`.
+- Encoders with a spatial patch merger (Qwen2.5-VL): see
+  :func:`fold_merged_token_scores`.
 
 The method exploits the hierarchical attention inside the vision encoder:
 
@@ -32,6 +37,8 @@ Split of responsibilities (mirrors EVS in ``vllm/multimodal/evs.py``):
   the invariant that keeps the prompt and the encoder output consistent.
 """
 
+from collections.abc import Mapping
+
 import torch
 
 # Default HiPrune hyperparameters for Gemma 4's 16-layer vision encoder.
@@ -39,7 +46,37 @@ import torch
 # paper's anchor-budget fraction. Neither is paper-validated for Gemma
 # (the paper covers LLaVA and Qwen2.5-VL only).
 GEMMA4_OBJECT_LAYER = 8
+# Object layer (1-based) for Qwen2.5-VL's 32-layer vision encoder. This is
+# the middle layer, matching the authors' released Qwen2.5-VL configuration
+# (HIPRUNE_OBJECT_LAYER=16); the deep layer is the last (32nd) block.
+QWEN2_5_VL_OBJECT_LAYER = 16
 DEFAULT_ALPHA = 0.1
+
+
+def get_hiprune_ratio(merged_kwargs: Mapping[str, object]) -> float | None:
+    """Extract and validate the HiPrune retention ratio from mm kwargs.
+
+    The ratio is the fraction of image tokens KEPT (e.g. 0.14 keeps 14%).
+    ``None`` or ``1.0`` disables pruning. Passed per-request via
+    ``mm_processor_kwargs={"hiprune_ratio": ...}`` (or the ``token_pruning``
+    chat-completions field, which maps onto it).
+    """
+    val = merged_kwargs.get("hiprune_ratio")
+    if val is None:
+        return None
+    ratio = float(val)  # type: ignore[arg-type]
+    if not 0.0 < ratio <= 1.0:
+        raise ValueError(
+            f"hiprune_ratio must be in (0, 1], got {ratio}. It is the "
+            "fraction of image tokens to KEEP."
+        )
+    if ratio == 1.0:
+        return None
+    # Quantize to float32: the ratio travels to the model in a float32
+    # tensor, and compute_retained_tokens_count rounds, so the processor
+    # must use the exact same bits or the placeholder count can differ
+    # from the model's kept-token count near half-integer boundaries.
+    return float(torch.tensor(ratio, dtype=torch.float32).item())
 
 
 def compute_retained_tokens_count(num_tokens: int, pruning_ratio: float) -> int:
@@ -119,6 +156,35 @@ def aggregate_patch_attention(
     patch_scores = attn[valid][:, valid].mean(dim=0)  # (num_valid,)
     weights = torch.nn.functional.one_hot(kernel_idx.long(), num_soft_tokens)
     return weights.float().T @ patch_scores
+
+
+def fold_merged_token_scores(
+    patch_scores: torch.Tensor,
+    spatial_merge_unit: int,
+    reverse_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Fold per-patch key scores into per-merged-token scores (Qwen2.5-VL).
+
+    Mirrors the authors' Qwen2.5-VL reference aggregation: the vision
+    tower processes patches in window-permuted order, where each
+    consecutive group of ``spatial_merge_unit`` patches is one 2x2 merge
+    unit; the per-patch scores are averaged within each unit and then
+    un-permuted back to the original (raster) merged-token order with
+    ``reverse_indices`` (the inverse of the tower's window permutation).
+
+    Args:
+        patch_scores: ``(num_patches,)`` per-key attention scores in the
+            tower's window-permuted patch order (mean over heads and
+            queries of the post-softmax attention).
+        spatial_merge_unit: patches per merged token (4 for Qwen2.5-VL).
+        reverse_indices: ``(num_patches // spatial_merge_unit,)`` inverse
+            window permutation over merge units.
+
+    Returns:
+        ``(num_merged_tokens,)`` float32 scores in raster order.
+    """
+    unit_scores = patch_scores.float().view(-1, spatial_merge_unit).mean(dim=-1)
+    return unit_scores[reverse_indices]
 
 
 def hiprune_select(

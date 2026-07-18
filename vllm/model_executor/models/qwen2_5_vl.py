@@ -73,6 +73,16 @@ from vllm.multimodal.evs import (
     compute_retention_mask,
     recompute_mrope_positions,
 )
+from vllm.multimodal.hiprune import (
+    QWEN2_5_VL_OBJECT_LAYER,
+    build_hiprune_metadata,
+    fold_merged_token_scores,
+    get_hiprune_ratio,
+    hiprune_select,
+)
+from vllm.multimodal.hiprune import (
+    compute_retained_tokens_count as hiprune_retained_tokens_count,
+)
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalFieldConfig,
@@ -181,6 +191,13 @@ class Qwen2_5_VLImagePixelInputs(TensorSchema):
         torch.Tensor,
         TensorShape("ni", 3),
     ]
+
+    # HiPrune retention ratio per image (fraction of merged tokens kept),
+    # emitted by the processor only when pruning is requested.
+    hiprune_ratio: Annotated[
+        torch.Tensor | None,
+        TensorShape("ni"),
+    ] = None
 
 
 class Qwen2_5_VLImageEmbeddingInputs(TensorSchema):
@@ -454,6 +471,89 @@ class Qwen2_5_VisionAttention(nn.Module):
 
         output, _ = self.proj(context_layer)
         return output
+
+    def compute_hiprune_key_scores(
+        self,
+        x: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        total_num_heads: int,
+        query_chunk_size: int = 512,
+    ) -> torch.Tensor:
+        """Per-key attention scores for HiPrune, without running attention.
+
+        Recomputes this layer's rope-applied Q/K from the block input (the
+        same arithmetic as :meth:`forward`) and returns, for every key
+        patch, the post-softmax attention it receives averaged over all
+        heads and all query patches — the HiPrune authors' "global
+        attention" statistic captured from a dense, unmasked attention
+        matrix (no window mask), matching their released Qwen2.5-VL code.
+
+        Chunked over queries so the full (heads, seq, seq) matrix is never
+        materialized; softmax is per-query-row, so chunking is exact.
+
+        Args:
+            x: ``(seq_len, 1, embed_dim)`` normed hidden states entering
+                this block (i.e. ``blk.norm1(hidden_states)``).
+            rotary_pos_emb_cos: rope cos table in window-permuted order.
+            rotary_pos_emb_sin: rope sin table in window-permuted order.
+            total_num_heads: head count across all TP ranks (scores from
+                local heads are all-reduced and averaged over this).
+            query_chunk_size: queries scored per chunk.
+
+        Returns:
+            ``(seq_len,)`` float32 per-key scores in window-permuted patch
+            order (a distribution: sums to 1).
+        """
+        with torch.no_grad():
+            x_qkv, _ = self.qkv(x)
+            seq_len, batch_size, _ = x_qkv.shape
+
+            qkv = einops.rearrange(
+                x_qkv,
+                "s b (three head head_dim) -> b s three head head_dim",
+                three=3,
+                head=self.num_attention_heads_per_partition,
+            )
+            qk = qkv[:, :, :2]
+            qk_reshaped = einops.rearrange(
+                qk, "b s two head head_dim -> (two b) s head head_dim", two=2
+            ).contiguous()
+            qk_rotated = self.apply_rotary_emb(
+                qk_reshaped,
+                rotary_pos_emb_cos,
+                rotary_pos_emb_sin,
+            )
+            qk_rotated = qk_rotated.view(
+                2,
+                batch_size,
+                seq_len,
+                self.num_attention_heads_per_partition,
+                self.hidden_size_per_attention_head,
+            )
+            q, k = qk_rotated.unbind(dim=0)
+
+            # (heads, seq, head_dim), float32 for a stable softmax.
+            q = q[0].permute(1, 0, 2).float()
+            k = k[0].permute(1, 0, 2).float()
+            scale = self.hidden_size_per_attention_head**-0.5
+
+            scores = q.new_zeros(seq_len)
+            for start in range(0, seq_len, query_chunk_size):
+                q_chunk = q[:, start : start + query_chunk_size]
+                logits = torch.matmul(q_chunk, k.transpose(1, 2)) * scale
+                probs = torch.softmax(logits, dim=-1)
+                # Sum over local heads and chunk queries.
+                scores += probs.sum(dim=(0, 1))
+
+            if self.tp_size > 1:
+                from vllm.distributed.communication_op import (
+                    tensor_model_parallel_all_reduce,
+                )
+
+                scores = tensor_model_parallel_all_reduce(scores)
+
+            return scores / (total_num_heads * seq_len)
 
 
 @support_torch_compile(
@@ -1124,6 +1224,96 @@ class Qwen2_5_VisionTransformer(nn.Module):
         hidden_states = hidden_states[reverse_indices, :]
         return hidden_states
 
+    def forward_capturing_hiprune_scores(
+        self,
+        x: torch.Tensor,
+        grid_thw: list[list[int]],
+        capture_layer_idxs: tuple[int, ...],
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+        """Encode a single image, capturing HiPrune attention scores.
+
+        Same computation as :meth:`forward`, but at each block index in
+        ``capture_layer_idxs`` the per-key attention scores are computed
+        from that block's input (dense, unmasked — the HiPrune authors'
+        reference statistic) and aggregated onto merged tokens.
+
+        Restricted to a single image so the dense score softmax never
+        spans keys from other images, exactly like the reference, which
+        encodes one image at a time.
+
+        Returns:
+            ``(merged_embeds, scores_by_layer)`` where ``merged_embeds``
+            is the usual ``(num_merged_tokens, out_hidden_size)`` output
+            in raster order and ``scores_by_layer`` maps each captured
+            block index to ``(num_merged_tokens,)`` float32 scores, also
+            in raster order.
+        """
+        assert len(grid_thw) == 1, (
+            "HiPrune score capture processes one image at a time"
+        )
+        hidden_states = x.to(device=self.device, dtype=self.dtype)
+        hidden_states = self.patch_embed(hidden_states)
+
+        seq_len = hidden_states.shape[0]
+        encoder_metadata = self.prepare_encoder_metadata(grid_thw)
+
+        rotary_pos_emb_cos = encoder_metadata["rotary_pos_emb_cos"]
+        rotary_pos_emb_sin = encoder_metadata["rotary_pos_emb_sin"]
+        window_index = encoder_metadata["window_index"]
+        reverse_indices = encoder_metadata["reverse_indices"]
+        cu_seqlens = encoder_metadata["cu_seqlens"]
+        cu_window_seqlens = encoder_metadata["cu_window_seqlens"]
+        max_seqlen_full = encoder_metadata["max_seqlen_full"]
+        max_seqlen_window = encoder_metadata["max_seqlen_window"]
+        sequence_lengths_full = encoder_metadata.get("sequence_lengths_full")
+        sequence_lengths_window = encoder_metadata.get("sequence_lengths_window")
+
+        hidden_states = hidden_states.reshape(
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
+        hidden_states = hidden_states[window_index, :, :]
+        hidden_states = hidden_states.reshape(seq_len, -1)
+
+        hidden_states = hidden_states.unsqueeze(1)
+
+        scores_by_layer: dict[int, torch.Tensor] = {}
+        for layer_num, blk in enumerate(self.blocks):
+            if layer_num in capture_layer_idxs:
+                patch_scores = blk.attn.compute_hiprune_key_scores(
+                    blk.norm1(hidden_states),
+                    rotary_pos_emb_cos,
+                    rotary_pos_emb_sin,
+                    total_num_heads=self.num_heads,
+                )
+                scores_by_layer[layer_num] = fold_merged_token_scores(
+                    patch_scores, self.spatial_merge_unit, reverse_indices
+                )
+
+            if layer_num in self.fullatt_block_indexes:
+                cu_seqlens_now = cu_seqlens
+                max_seqlen_now = max_seqlen_full
+                sequence_lengths_now = sequence_lengths_full
+            else:
+                cu_seqlens_now = cu_window_seqlens
+                max_seqlen_now = max_seqlen_window
+                sequence_lengths_now = sequence_lengths_window
+
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens_now,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+                max_seqlen=max_seqlen_now,
+                sequence_lengths=sequence_lengths_now,
+            )
+
+        if hidden_states.dtype == torch.float16:
+            hidden_states = cast_overflow_tensors(hidden_states)
+
+        hidden_states = self.merger(hidden_states)
+        hidden_states = hidden_states[reverse_indices, :]
+        return hidden_states, scores_by_layer
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
@@ -1134,6 +1324,9 @@ class Qwen2_5_VLProcessingInfo(Qwen2VLProcessingInfo):
         return self.ctx.get_hf_config(Qwen2_5_VLConfig)
 
     def get_hf_processor(self, **kwargs: object) -> Qwen2_5_VLProcessor:
+        # hiprune_ratio is a vLLM-side kwarg (placeholder sizing + model
+        # selection); the HF processor does not know it.
+        kwargs.pop("hiprune_ratio", None)
         return self.ctx.get_hf_processor(
             Qwen2_5_VLProcessor,
             use_fast=kwargs.pop("use_fast", True),
@@ -1150,6 +1343,7 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
         return dict(
             **super()._get_mm_fields_config(hf_inputs, hf_processor_mm_kwargs),
             second_per_grid_ts=MultiModalFieldConfig.batched("video", keep_on_cpu=True),
+            hiprune_ratio=MultiModalFieldConfig.batched("image"),
         )
 
     def _call_hf_processor(
@@ -1159,9 +1353,38 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
         mm_kwargs: Mapping[str, object],
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        # Override to use the text path instead of token path to use the
+        hiprune_ratio = get_hiprune_ratio(mm_kwargs)
+        if hiprune_ratio is not None:
+            mm_config = self.info.ctx.get_mm_config()
+            if not mm_config.is_multimodal_pruning_enabled():
+                raise ValueError(
+                    "hiprune_ratio (token_pruning) requires the server to "
+                    "be started with --enable-hiprune, which activates the "
+                    "multimodal-pruning position handling."
+                )
+            # The HF processor does not know the vLLM-side kwarg.
+            mm_kwargs = {
+                k: v for k, v in mm_kwargs.items() if k != "hiprune_ratio"
+            }
+
+        # Use the text path instead of token path to use the
         # video-specific logic in processing_qwen2_5_vl.py
-        return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+        processed_outputs = super()._call_hf_processor(
+            prompt, mm_data, mm_kwargs, tok_kwargs
+        )
+
+        # HiPrune: attach the retention ratio per image so it reaches the
+        # model at encode time (the engine-global EVS pattern does not work
+        # here because the ratio is per-request). The prompt placeholder
+        # count is reduced in _get_prompt_updates with the same count
+        # function the model uses at selection time.
+        if hiprune_ratio is not None and "image_grid_thw" in processed_outputs:
+            num_images = len(processed_outputs["image_grid_thw"])
+            processed_outputs["hiprune_ratio"] = torch.full(
+                (num_images,), hiprune_ratio, dtype=torch.float32
+            )
+
+        return processed_outputs
 
     def _get_prompt_updates(
         self,
@@ -1180,6 +1403,7 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
         }
 
         merge_length = image_processor.merge_size**2
+        hiprune_ratio = get_hiprune_ratio(hf_processor_mm_kwargs)
 
         def get_replacement_qwen2vl(item_idx: int, modality: str):
             out_item = out_mm_kwargs[modality][item_idx]
@@ -1205,6 +1429,14 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
                     video_pruning_rate,
                 )
             # End of EVS-specific code
+
+            # HiPrune: shrink the image placeholder run to the retained
+            # budget. The model keeps exactly this many tokens at encode
+            # time (same count function on both sides).
+            if modality == "image" and hiprune_ratio is not None:
+                num_tokens = hiprune_retained_tokens_count(
+                    num_tokens, hiprune_ratio
+                )
 
             return [placeholder[modality]] * num_tokens
 
@@ -1375,12 +1607,21 @@ class Qwen2_5_VLForConditionalGeneration(
             self.language_model.make_empty_intermediate_tensors
         )
 
+        # HiPrune state for the most recent embed_multimodal call: per-item
+        # pruning metadata (read by the model runner and returned via
+        # token_pruning_metadata) and kept-token masks (consumed by
+        # _postprocess_image_embeds_evs to prune mrope positions).
+        self._hiprune_metadata: list[dict[str, object] | None] = []
+        self._hiprune_kept_masks: list[torch.Tensor | None] = []
+        self.hiprune_metadata_per_item: list[dict[str, object] | None] = []
+
     def _parse_and_validate_image_input(
         self, **kwargs: object
     ) -> Qwen2_5_VLImageInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)
         image_embeds = kwargs.pop("image_embeds", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
+        hiprune_ratio = kwargs.pop("hiprune_ratio", None)
 
         if pixel_values is None and image_embeds is None:
             return None
@@ -1390,6 +1631,7 @@ class Qwen2_5_VLForConditionalGeneration(
                 type="pixel_values",
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                hiprune_ratio=hiprune_ratio,
             )
 
         if image_embeds is not None:
@@ -1432,14 +1674,39 @@ class Qwen2_5_VLForConditionalGeneration(
         grid_thw = image_input["image_grid_thw"]
         assert grid_thw.ndim == 2
         grid_thw_list = grid_thw.tolist()
+        num_images = len(grid_thw_list)
+
+        # HiPrune bookkeeping for this call: per-image pruning metadata
+        # (for API reporting) and kept-token masks (consumed by
+        # _postprocess_image_embeds_evs to prune the appended mrope
+        # positions with the same mask as the embeddings).
+        self._hiprune_metadata = [None] * num_images
+        self._hiprune_kept_masks: list[torch.Tensor | None] = [None] * num_images
+
+        ratios: list[float | None] = [None] * num_images
+        if image_input["type"] == "pixel_values":
+            hp_field = image_input.get("hiprune_ratio")
+            if hp_field is not None:
+                for idx in range(num_images):
+                    ratio = float(hp_field[idx])
+                    ratios[idx] = ratio if ratio < 1.0 else None
 
         if image_input["type"] == "image_embeds":
             image_embeds = image_input["image_embeds"].type(self.visual.dtype)
         else:
             pixel_values = image_input["pixel_values"]
             if self.use_data_parallel:
+                if any(r is not None for r in ratios):
+                    raise NotImplementedError(
+                        "HiPrune is not supported with data-parallel "
+                        "vision encoding (--mm-encoder-tp-mode data)."
+                    )
                 return run_dp_sharded_mrope_vision_model(
                     self.visual, pixel_values, grid_thw_list, rope_type="rope_3d"
+                )
+            elif any(r is not None for r in ratios):
+                return self._process_image_input_hiprune(
+                    pixel_values, grid_thw_list, ratios
                 )
             else:
                 image_embeds = self.visual(pixel_values, grid_thw=grid_thw_list)
@@ -1448,6 +1715,75 @@ class Qwen2_5_VLForConditionalGeneration(
         merge_size = self.visual.spatial_merge_size
         sizes = (grid_thw.prod(-1) // merge_size // merge_size).tolist()
         return image_embeds.split(sizes)
+
+    def _process_image_input_hiprune(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw_list: list[list[int]],
+        ratios: list[float | None],
+    ) -> tuple[torch.Tensor, ...]:
+        """Encode images one at a time, pruning with HiPrune where requested.
+
+        Images are encoded individually because the score capture computes
+        a dense, unmasked attention softmax over the whole patch sequence
+        (the reference statistic), which must not span keys from other
+        images — and because the dense score pass has a much higher memory
+        cost than the windowed encoder attention.
+
+        For each pruned image, the anchor/buffer/register selection keeps
+        exactly ``compute_retained_tokens_count(num_tokens, ratio)`` merged
+        tokens — the same count the processor used for the placeholder run
+        — and the kept-token mask and metadata are stashed for
+        _postprocess_image_embeds_evs and the API layer respectively.
+        """
+        merge_size = self.visual.spatial_merge_size
+        object_layer_idx = QWEN2_5_VL_OBJECT_LAYER - 1
+        deep_layer_idx = len(self.visual.blocks) - 1
+
+        patch_counts = [t * h * w for t, h, w in grid_thw_list]
+        pixel_values_per_image = pixel_values.split(patch_counts)
+
+        image_embeds_out: list[torch.Tensor] = []
+        for idx, (pv, thw, ratio) in enumerate(
+            zip(pixel_values_per_image, grid_thw_list, ratios)
+        ):
+            if ratio is None:
+                image_embeds_out.append(self.visual(pv, grid_thw=[thw]))
+                continue
+
+            embeds, scores_by_layer = self.visual.forward_capturing_hiprune_scores(
+                pv,
+                [thw],
+                capture_layer_idxs=(object_layer_idx, deep_layer_idx),
+            )
+            shallow = scores_by_layer[object_layer_idx]
+            deep = scores_by_layer[deep_layer_idx]
+
+            t, h, w = thw
+            grid_h = h // merge_size
+            grid_w = w // merge_size
+            num_tokens = t * grid_h * grid_w
+            assert embeds.shape[0] == num_tokens == shallow.shape[0]
+
+            anchor_idx, buffer_idx, register_idx, kept_mask = hiprune_select(
+                shallow, deep, num_tokens, grid_w, ratio
+            )
+            image_embeds_out.append(embeds[kept_mask])
+            self._hiprune_kept_masks[idx] = kept_mask
+            self._hiprune_metadata[idx] = build_hiprune_metadata(
+                anchor_idx,
+                buffer_idx,
+                register_idx,
+                kept_mask,
+                shallow,
+                deep,
+                grid_w,
+                grid_h,
+                ratio,
+                object_layer=QWEN2_5_VL_OBJECT_LAYER,
+            )
+
+        return tuple(image_embeds_out)
 
     def _postprocess_image_embeds_evs(
         self,
@@ -1473,10 +1809,15 @@ class Qwen2_5_VLForConditionalGeneration(
         grid_thw = image_input["image_grid_thw"]
         grid_thw_list = grid_thw.tolist()
         image_embeds_out = []
-        for emb, size in zip(image_embeds_split, grid_thw_list):
+        for idx, (emb, size) in enumerate(zip(image_embeds_split, grid_thw_list)):
             positions = compute_mrope_for_media(size, merge_size).to(
                 emb.device, non_blocking=True
             )
+            # HiPrune: keep only the positions of retained tokens, so each
+            # kept token carries its original spatial mrope position.
+            kept_mask = self._hiprune_kept_masks[idx]
+            if kept_mask is not None:
+                positions = positions[kept_mask]
             emb = torch.cat([emb, positions], dim=1)
             image_embeds_out.append(emb)
         image_embeds_split = image_embeds_out
@@ -1652,11 +1993,16 @@ class Qwen2_5_VLForConditionalGeneration(
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
+            self.hiprune_metadata_per_item = []
             return []
 
         # The result multimodal_embeddings is tuple of tensors, with each
         # tensor correspoending to a multimodal data item (image or video).
         multimodal_embeddings: tuple[torch.Tensor, ...] = ()
+        # Per returned item: HiPrune metadata (None when the item was not
+        # pruned). The model runner reads this right after embed_multimodal
+        # to cache the metadata alongside the encoder outputs.
+        metadata_per_item: list[dict[str, object] | None] = []
 
         # NOTE: It is important to iterate over the keys in this dictionary
         # to preserve the order of the modalities.
@@ -1669,6 +2015,7 @@ class Qwen2_5_VLForConditionalGeneration(
                         image_embeddings, multimodal_input
                     )
                 multimodal_embeddings += tuple(image_embeddings)
+                metadata_per_item.extend(self._hiprune_metadata)
             if modality == "video":
                 video_embeddings = self._process_video_input(multimodal_input)
                 if self.is_multimodal_pruning_enabled:
@@ -1676,6 +2023,9 @@ class Qwen2_5_VLForConditionalGeneration(
                         video_embeddings, multimodal_input
                     )
                 multimodal_embeddings += tuple(video_embeddings)
+                metadata_per_item.extend([None] * len(video_embeddings))
+
+        self.hiprune_metadata_per_item = metadata_per_item
         return multimodal_embeddings
 
     # -- SupportsEncoderCudaGraph protocol methods --

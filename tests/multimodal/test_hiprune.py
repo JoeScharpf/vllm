@@ -6,10 +6,13 @@ import pytest
 import torch
 
 from vllm.multimodal.hiprune import (
+    QWEN2_5_VL_OBJECT_LAYER,
     aggregate_patch_attention,
     build_hiprune_metadata,
     compute_retained_tokens_count,
     compute_soft_token_grid,
+    fold_merged_token_scores,
+    get_hiprune_ratio,
     hiprune_select,
 )
 
@@ -175,3 +178,220 @@ def test_metadata_contents():
     )
     # Anchors are the top of the object-layer distribution by construction.
     assert ma["object_layer"]["anchor"] > ma["object_layer"]["pruned"]
+
+
+# --------------------------------------------------------------------------
+# Qwen2.5-VL support
+# --------------------------------------------------------------------------
+
+MERGE_UNIT = 4  # Qwen2.5-VL spatial_merge_size**2
+
+
+def test_metadata_object_layer_parameterized():
+    torch.manual_seed(2)
+    grid_w, grid_h = 8, 6
+    n_tokens = grid_w * grid_h
+    shallow = torch.rand(n_tokens).softmax(dim=0)
+    deep = torch.rand(n_tokens).softmax(dim=0)
+    anchor, buffer, register, kept = hiprune_select(
+        shallow, deep, n_tokens, grid_w, 0.25
+    )
+    md = build_hiprune_metadata(
+        anchor,
+        buffer,
+        register,
+        kept,
+        shallow,
+        deep,
+        grid_w,
+        grid_h,
+        0.25,
+        object_layer=QWEN2_5_VL_OBJECT_LAYER,
+    )
+    assert md["object_layer"] == QWEN2_5_VL_OBJECT_LAYER
+
+
+@pytest.mark.parametrize("val,expected", [(None, None), (1.0, None), (0.14, 0.14)])
+def test_get_hiprune_ratio_passthrough(val, expected):
+    got = get_hiprune_ratio({"hiprune_ratio": val})
+    if expected is None:
+        assert got is None
+    else:
+        assert got == pytest.approx(expected)
+        # float32-quantized so processor and model round identically.
+        assert got == float(torch.tensor(val, dtype=torch.float32).item())
+
+
+@pytest.mark.parametrize("val", [0.0, -0.1, 1.5])
+def test_get_hiprune_ratio_rejects_out_of_range(val):
+    with pytest.raises(ValueError):
+        get_hiprune_ratio({"hiprune_ratio": val})
+
+
+def _random_window_permutation(num_units: int, generator: torch.Generator):
+    window_index = torch.randperm(num_units, generator=generator)
+    reverse_indices = torch.argsort(window_index)
+    return window_index, reverse_indices
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_fold_merged_token_scores_unpermutes(seed: int):
+    """Folding + un-permutation must recover raster-order token scores."""
+    g = torch.Generator().manual_seed(seed)
+    num_units = 60
+    window_index, reverse_indices = _random_window_permutation(num_units, g)
+
+    # Ground truth: one score per merged token in raster order.
+    unit_truth = torch.rand(num_units, generator=g)
+    # Patch scores in permuted order: each unit's 4 patches average to
+    # the unit's truth value.
+    noise = torch.rand(num_units, MERGE_UNIT, generator=g)
+    noise = noise - noise.mean(dim=-1, keepdim=True)
+    patch_scores = (unit_truth[window_index, None] + noise).reshape(-1)
+
+    folded = fold_merged_token_scores(patch_scores, MERGE_UNIT, reverse_indices)
+    assert torch.allclose(folded, unit_truth, atol=1e-6)
+
+
+@pytest.mark.parametrize("seed", range(10))
+@pytest.mark.parametrize("ratio", [0.11, 0.25, 0.5])
+def test_qwen_pipeline_matches_reference(seed: int, ratio: float):
+    """Differential test against a direct transcription of the authors'
+    Qwen2.5-VL reference: given the same per-layer attention matrices
+    (in window-permuted patch order), our fold + select pipeline must
+    keep exactly the same token set, split into the same categories.
+    """
+    g = torch.Generator().manual_seed(seed)
+    grid_w, grid_h = 12, 9
+    n_tokens = grid_w * grid_h
+    n_patches = n_tokens * MERGE_UNIT
+    num_heads = 4
+
+    window_index, reverse_indices = _random_window_permutation(n_tokens, g)
+
+    def rand_attn():
+        # Dense unmasked post-softmax attention over permuted patches.
+        return torch.rand(
+            num_heads, n_patches, n_patches, generator=g
+        ).softmax(dim=-1)
+
+    attn_shallow = rand_attn()
+    attn_deep = rand_attn()
+
+    # ---- Reference transcription (modeling_qwen2_5_vl.py, HiPrune fork) --
+    def ref_aggregate(attn):
+        w = attn.mean(dim=0)  # average all heads
+        w = w.mean(dim=0)  # average all queries -> per-key score
+        w = w.view(w.shape[0] // MERGE_UNIT, -1).mean(dim=-1)
+        return w[reverse_indices]
+
+    ref_shallow = ref_aggregate(attn_shallow)
+    ref_deep = ref_aggregate(attn_deep).clone()
+
+    visual_token_num = round(n_tokens * ratio)
+    shallow_token_num = round((visual_token_num * 0.1) / 5)
+    shallow_idx = torch.topk(ref_shallow, k=shallow_token_num).indices
+    shallow_all = torch.cat(
+        [
+            shallow_idx,
+            shallow_idx - 1,
+            shallow_idx + 1,
+            shallow_idx - grid_w,
+            shallow_idx + grid_w,
+        ]
+    ).clamp(0, n_tokens - 1)
+    shallow_all = torch.unique(shallow_all, sorted=False)
+    deep_token_num = visual_token_num - shallow_all.shape[0]
+    avail = torch.zeros(n_tokens, dtype=torch.bool)
+    avail.scatter_(0, shallow_all, 1)
+    ref_deep -= avail.int()
+    deep_idx = torch.topk(ref_deep, k=deep_token_num).indices
+    ref_mask = torch.zeros(n_tokens, dtype=torch.bool)
+    ref_mask[torch.cat([shallow_all, deep_idx])] = True
+    # ---------------------------------------------------------------------
+
+    # Our pipeline: per-key scores (mean over heads and queries) fed
+    # through fold_merged_token_scores, then hiprune_select.
+    def our_scores(attn):
+        per_key = attn.mean(dim=0).mean(dim=0)
+        return fold_merged_token_scores(per_key, MERGE_UNIT, reverse_indices)
+
+    shallow = our_scores(attn_shallow)
+    deep = our_scores(attn_deep)
+    assert torch.allclose(shallow, ref_aggregate(attn_shallow), atol=1e-7)
+
+    anchor, buffer, register, kept = hiprune_select(
+        shallow, deep, n_tokens, grid_w, ratio
+    )
+    assert torch.equal(kept, ref_mask)
+    # Anchor/buffer split partitions the reference's shallow set.
+    assert set(torch.cat([anchor, buffer]).tolist()) == set(shallow_all.tolist())
+    assert set(register.tolist()) == set(deep_idx.tolist())
+
+
+@pytest.mark.parametrize("keep_every", [2, 3])
+def test_recompute_mrope_keeps_original_positions_for_kept_tokens(keep_every):
+    """After pruning, each kept image token must carry its ORIGINAL
+    spatial mrope position (the EVS/HiPrune position semantics), and
+    trailing text must resume after the image's position span.
+    """
+    from vllm.multimodal.evs import (
+        compute_mrope_for_media,
+        recompute_mrope_positions,
+    )
+
+    vision_start_id, image_id, video_id, text_id = 90, 91, 92, 1
+    merge_size = 2
+    size = (1, 8, 12)  # grid_thw -> 4x6 = 24 merged tokens
+    n_tokens = (size[1] // merge_size) * (size[2] // merge_size)
+
+    positions_full = compute_mrope_for_media(
+        torch.tensor(size), merge_size
+    )  # (n_tokens, 4)
+    kept_mask = torch.zeros(n_tokens, dtype=torch.bool)
+    kept_mask[::keep_every] = True
+    mm_pos = positions_full[kept_mask].permute(1, 0).long()  # (4, kept)
+    n_kept = int(kept_mask.sum())
+
+    prefix_len, suffix_len = 5, 7
+    input_ids = torch.tensor(
+        [text_id] * (prefix_len - 1)
+        + [vision_start_id]
+        + [image_id] * n_kept
+        + [text_id] * suffix_len
+    )
+    total = input_ids.numel()
+    # Seed positions: plain text numbering (what the runner starts from).
+    seed_positions = (
+        torch.arange(total).view(1, -1).expand(3, -1).clone().long()
+    )
+
+    positions, _ = recompute_mrope_positions(
+        input_ids,
+        [mm_pos],
+        seed_positions,
+        num_computed_tokens=0,
+        vision_start_token_id=vision_start_id,
+        image_token_id=image_id,
+        video_token_id=video_id,
+    )
+
+    base = prefix_len  # text positions 0..prefix_len-1, image starts after
+    img_slice = positions[:, prefix_len : prefix_len + n_kept]
+    expected = mm_pos[0:3] + base
+    assert torch.equal(img_slice, expected)
+
+    # Kept tokens' (h, w) equal their original raster coordinates.
+    kept_idx = kept_mask.nonzero(as_tuple=True)[0]
+    grid_w_merged = size[2] // merge_size
+    assert torch.equal(
+        img_slice[1] - base, (kept_idx // grid_w_merged).long()
+    )
+    assert torch.equal(
+        img_slice[2] - base, (kept_idx % grid_w_merged).long()
+    )
+
+    # Trailing text resumes after the image's position span.
+    text_start = positions[:, prefix_len + n_kept]
+    expected_text_start = int(mm_pos[3, 0]) + base
+    assert (text_start == expected_text_start).all()
