@@ -533,18 +533,22 @@ class Qwen2_5_VisionAttention(nn.Module):
             )
             q, k = qk_rotated.unbind(dim=0)
 
-            # (heads, seq, head_dim), float32 for a stable softmax.
-            q = q[0].permute(1, 0, 2).float()
-            k = k[0].permute(1, 0, 2).float()
+            # (heads, seq, head_dim). The QK^T matmul runs in the model
+            # dtype (tensor cores); the softmax accumulates in float32.
+            # Selection is by rank, so fp16/bf16 logits do not change the
+            # kept set in practice.
+            q = q[0].permute(1, 0, 2).contiguous()
+            k_t = k[0].permute(1, 2, 0).contiguous()
             scale = self.hidden_size_per_attention_head**-0.5
 
-            scores = q.new_zeros(seq_len)
+            scores = torch.zeros(seq_len, dtype=torch.float32, device=q.device)
             for start in range(0, seq_len, query_chunk_size):
                 q_chunk = q[:, start : start + query_chunk_size]
-                logits = torch.matmul(q_chunk, k.transpose(1, 2)) * scale
+                logits = torch.matmul(q_chunk, k_t) * scale
                 probs = torch.softmax(logits, dim=-1)
-                # Sum over local heads and chunk queries.
-                scores += probs.sum(dim=(0, 1))
+                # Sum over local heads and chunk queries, accumulating in
+                # float32 without materializing a float32 prob matrix.
+                scores += probs.sum(dim=(0, 1), dtype=torch.float32)
 
             if self.tp_size > 1:
                 from vllm.distributed.communication_op import (
