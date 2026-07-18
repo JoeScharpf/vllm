@@ -1883,17 +1883,15 @@ class Qwen2_5_VLForConditionalGeneration(
         second_per_grid_ts = second_per_grid_ts.long()
         tokens_per_second = self.config.vision_config.tokens_per_second
 
+        # The pruning code path can be active without a video pruning rate
+        # (e.g. --enable-hiprune, which prunes images per-request); videos
+        # then pass through unpruned but still carry mrope positions.
+        evs_active = self.video_pruning_rate is not None and self.video_pruning_rate > 0
+
         video_embeds_out = []
         for emb, size, video_second_per_grid_t in zip(
             video_embeds_split, grid_thw_list, second_per_grid_ts
         ):
-            # For each video, we compute retention mask using EVS
-            retention_mask = compute_retention_mask(
-                emb,
-                size,
-                spatial_merge_size=self.visual.spatial_merge_size,
-                q=self.video_pruning_rate,
-            )
             positions = compute_mrope_for_media(
                 size,
                 merge_size,
@@ -1901,8 +1899,16 @@ class Qwen2_5_VLForConditionalGeneration(
                 video_second_per_grid=video_second_per_grid_t.item(),
             ).to(emb.device, non_blocking=True)
 
-            emb = emb[retention_mask]
-            positions = positions[retention_mask]
+            if evs_active:
+                # For each video, we compute retention mask using EVS
+                retention_mask = compute_retention_mask(
+                    emb,
+                    size,
+                    spatial_merge_size=self.visual.spatial_merge_size,
+                    q=self.video_pruning_rate,
+                )
+                emb = emb[retention_mask]
+                positions = positions[retention_mask]
             emb = torch.cat([emb, positions], dim=1)
             video_embeds_out.append(emb)
         return tuple(video_embeds_out)
