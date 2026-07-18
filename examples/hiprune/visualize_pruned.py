@@ -1,9 +1,13 @@
 """Render a HiPrune overlay from a vLLM chat response.
 
 Reads the original image and the pruning data returned by the vLLM
-server and draws it over the image: pruned 48x48 px cells are darkened
-and kept cells are outlined by HiPrune category — anchors (red),
-buffers (orange), registers (green).
+server and draws it over the image: pruned cells are darkened and kept
+cells are outlined by HiPrune category — anchors (red), buffers
+(orange), registers (green).
+
+Each grid cell covers --cell pixels of the (resized) image: 48 for
+Gemma 4 (16 px patches pooled 3x3, the default) and 28 for Qwen2.5-VL
+(14 px patches merged 2x2).
 
 Prefers the `token_pruning_metadata` response field (which carries the
 grid and token categories); falls back to `pruned_token_indices` (kept
@@ -27,7 +31,7 @@ Optional flags enrich the report:
 
 Usage:
     python3 visualize_pruned.py <image> <response.json> <output.png> \
-        [--baseline baseline.json] [--request request.json] \
+        [--cell 48] [--baseline baseline.json] [--request request.json] \
         [--timing timing.json]
 """
 
@@ -38,8 +42,9 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 POOL_K = 3      # Gemma pools 3x3 patches into one soft token
-PATCH = 16      # ViT patch size in px
-CELL = POOL_K * PATCH  # 48 px of resized image per soft token
+PATCH = 16      # Gemma ViT patch size in px
+GEMMA_CELL = POOL_K * PATCH  # 48 px of resized image per soft token
+QWEN_CELL = 14 * 2  # Qwen2.5-VL: 14 px patches merged 2x2 -> 28 px per token
 MAX_SOFT_TOKENS = 280
 
 ANCHOR_COLOR = (255, 60, 60, 255)
@@ -54,10 +59,11 @@ def gemma_grid(width: int, height: int) -> tuple[int, int]:
     MAX_SOFT_TOKENS soft tokens (mild aspect flooring)."""
     import math
 
-    scale = math.sqrt(MAX_SOFT_TOKENS * CELL * CELL / (width * height))
-    scale = min(scale, 1.0) if width * height > MAX_SOFT_TOKENS * CELL * CELL else scale
-    grid_w = max(1, int(width * scale // CELL))
-    grid_h = max(1, int(height * scale // CELL))
+    cell = GEMMA_CELL
+    scale = math.sqrt(MAX_SOFT_TOKENS * cell * cell / (width * height))
+    scale = min(scale, 1.0) if width * height > MAX_SOFT_TOKENS * cell * cell else scale
+    grid_w = max(1, int(width * scale // cell))
+    grid_h = max(1, int(height * scale // cell))
     while grid_w * grid_h > MAX_SOFT_TOKENS:
         if grid_w >= grid_h:
             grid_w -= 1
@@ -205,6 +211,11 @@ def main() -> None:
     parser.add_argument("--baseline", help="baseline (unpruned) response JSON")
     parser.add_argument("--request", help="request body JSON that was sent")
     parser.add_argument("--timing", help="benchmark.py output JSON")
+    parser.add_argument(
+        "--cell", type=int, default=GEMMA_CELL,
+        help="pixels per grid cell in the overlay: 48 for Gemma 4 "
+        f"(default), {QWEN_CELL} for Qwen2.5-VL",
+    )
     args = parser.parse_args()
 
     image_path, resp_path, out_path = args.image, args.response, args.output
@@ -242,11 +253,12 @@ def main() -> None:
         categories = {"kept": (kept, REGISTER_COLOR)}
 
     n_soft = grid_w * grid_h
-    resized = img.resize((grid_w * CELL, grid_h * CELL), Image.BICUBIC)
+    cell = args.cell
+    resized = img.resize((grid_w * cell, grid_h * cell), Image.BICUBIC)
 
     def cell_box(idx: int) -> list[int]:
         r, c = idx // grid_w, idx % grid_w
-        return [c * CELL, r * CELL, c * CELL + CELL, r * CELL + CELL]
+        return [c * cell, r * cell, c * cell + cell, r * cell + cell]
 
     overlay = resized.copy()
     draw = ImageDraw.Draw(overlay, "RGBA")

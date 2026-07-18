@@ -192,6 +192,13 @@ class MultiModalConfig:
     Value sits in range [0;1) and determines fraction of media tokens
     from each video to be pruned.
     """
+    enable_hiprune: bool = False
+    """Enables per-request HiPrune image token pruning for supported models
+    (e.g. Qwen2.5-VL). Requests opt in via
+    ``mm_processor_kwargs={"hiprune_ratio": ...}`` or the ``token_pruning``
+    chat-completions field; requests without a ratio are unaffected. Enabling
+    this activates the multimodal-pruning code path (per-item mRoPE position
+    recomputation, encoder CUDA graphs disabled)."""
     mm_tensor_ipc: MMTensorIPC = "direct_rpc"
     """IPC (inter-process communication) method for multimodal tensors.
     - "direct_rpc": Use msgspec serialization via RPC
@@ -345,4 +352,6 @@ class MultiModalConfig:
         return kwargs | dict(inference_kwargs)
 
     def is_multimodal_pruning_enabled(self):
-        return self.video_pruning_rate is not None and self.video_pruning_rate > 0
+        return (
+            self.video_pruning_rate is not None and self.video_pruning_rate > 0
+        ) or self.enable_hiprune

@@ -1,0 +1,43 @@
+{
+  "prompt": "Describe this image in detail.",
+  "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "max_tokens": 100,
+  "results": [
+    {
+      "ttft_s": 0.13527108915150166,
+      "decode_tok_s": 92.84655580853065,
+      "total_s": 1.201706450432539,
+      "prompt_tokens": 1847,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramids of Giza, an iconic archaeological site located in Egypt. The pyramids are constructed from large stone blocks and are arranged in a triangular formation. The largest pyramid is the Great Pyramid of Khufu, also known as the Pyramid of Cheops, which is the oldest and largest of the three. The other two pyramids are the Pyramid of Khafre and the Pyramid of Menkaure. The pyramids are set against a clear blue sky, and the",
+      "retention": 1.0
+    },
+    {
+      "ttft_s": 0.3626802070066333,
+      "decode_tok_s": 93.09184115125227,
+      "total_s": 1.4263329561799765,
+      "prompt_tokens": 937,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramids of Giza, an iconic archaeological complex located in Egypt. The three pyramids are prominently visible against a clear blue sky. The largest pyramid, known as the Pyramid of Khufu (also called the Great Pyramid), is situated on the left side of the image. It is the oldest and largest of the three pyramids, constructed around 2560 BCE during the Old Kingdom period.\n\nTo the right of the Pyramid of Khufu, there are",
+      "retention": 0.5
+    },
+    {
+      "ttft_s": 0.3411154579371214,
+      "decode_tok_s": 93.13124981613116,
+      "total_s": 1.4042723812162876,
+      "prompt_tokens": 573,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramids of Giza, an iconic archaeological complex located in Egypt. The three pyramids are prominently visible against a clear blue sky. The largest pyramid is the Great Pyramid of Khufu, also known as the Pyramid of Cheops, which is the oldest and largest of the three. To its right is the Pyramid of Khafre, or the Pyramid of Chephren, and to its left is the Pyramid of Menkaure, or the Pyramid of Myker",
+      "retention": 0.3
+    },
+    {
+      "ttft_s": 0.3269921690225601,
+      "decode_tok_s": 93.21464236366695,
+      "total_s": 1.389171127229929,
+      "prompt_tokens": 282,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramids of Giza, one of the most iconic and ancient structures in the world. The pyramids are constructed from large stone blocks and are situated in the Giza Plateau, which is part of the Giza Necropolis in Egypt. The pyramids are known for their impressive size, stability, and the precision with which they were built.\n\nIn the foreground, there are several people riding horses, likely tourists or visitors to the site. The desert landscape surrounding the py",
+      "retention": 0.14
+    }
+  ]
+}

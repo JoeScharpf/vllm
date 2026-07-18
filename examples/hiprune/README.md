@@ -1,10 +1,12 @@
 # HiPrune demo: visualize pruned patches from a served response
 
 `visualize_pruned.py` renders the pruning data returned by a vLLM server
-running Gemma 4 with HiPrune (see the `token_pruning` request field) as
-an overlay on the original image: pruned 48x48 px cells are darkened and
-kept cells are outlined by HiPrune category — anchors (red), buffers
-(orange), registers (green).
+running Gemma 4 or Qwen2.5-VL with HiPrune (see the `token_pruning`
+request field) as an overlay on the original image: pruned cells are
+darkened and kept cells are outlined by HiPrune category — anchors
+(red), buffers (orange), registers (green). Each cell covers `--cell`
+pixels of the resized image: 48 for Gemma 4 (the default) and 28 for
+Qwen2.5-VL.
 
 Responses carry two pruning fields:
 
@@ -18,7 +20,12 @@ Responses carry two pruning fields:
 1. Serve the model:
 
    ```bash
+   # Gemma 4
    VLLM_USE_V2_MODEL_RUNNER=0 vllm serve google/gemma-4-e4b-it --max-model-len 8192
+
+   # Qwen2.5-VL (requires --enable-hiprune, which activates the
+   # multimodal-pruning position handling and disables encoder CUDA graphs)
+   vllm serve Qwen/Qwen2.5-VL-3B-Instruct --max-model-len 32768 --enable-hiprune
    ```
 
 2. Send a request with `token_pruning` and save the JSON response:
@@ -40,7 +47,8 @@ Responses carry two pruning fields:
 3. Render the overlay:
 
    ```bash
-   python3 visualize_pruned.py image.jpg response.json overlay.png
+   python3 visualize_pruned.py image.jpg response.json overlay.png   # Gemma 4
+   python3 visualize_pruned.py image.jpg response.json overlay.png --cell 28  # Qwen2.5-VL
    ```
 
    Alongside `overlay.png` this also writes readable artifacts:
@@ -59,6 +67,18 @@ Responses carry two pruning fields:
    python3 visualize_pruned.py image.jpg response.json overlay.png \
        --baseline baseline.json --request request.json
    ```
+
+## Qwen2.5-VL notes
+
+Unlike Gemma 4 (capped at 280 soft tokens per image), Qwen2.5-VL has no
+token cap: a 4K image produces thousands of merged tokens, which is
+where pruning actually pays off in prefill latency, not just prompt
+length. The port follows the authors' released Qwen2.5-VL code exactly
+for token selection: per-key attention captured dense and unmasked at
+the object layer (16, the middle of the 32-block encoder) and the last
+layer, averaged over heads and queries, folded 2x2 to merged tokens.
+Kept tokens retain their original mRoPE grid positions (the same
+position handling vLLM uses for EVS video pruning).
 
 ## Latency benchmark
 
