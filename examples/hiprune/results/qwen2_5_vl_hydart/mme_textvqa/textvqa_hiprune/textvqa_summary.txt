@@ -1,0 +1,7 @@
+TextVQA | Qwen/Qwen2.5-VL-3B-Instruct | 1000 validation samples
+
+ retention  vqa acc  zero-credit  prompt tok  mean TTFT
+-------------------------------------------------------
+      0.50    0.782          179       529.6     0.183s
+      0.30    0.720          240       333.5     0.170s
+      0.14    0.587          373       176.6     0.161s

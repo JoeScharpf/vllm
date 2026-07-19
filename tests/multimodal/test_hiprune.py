@@ -400,6 +400,63 @@ def test_recompute_mrope_keeps_original_positions_for_kept_tokens(keep_every):
     assert (text_start == expected_text_start).all()
 
 
+def test_recompute_mrope_chunk_boundary_after_vision_start():
+    """Chunked prefill can split a request exactly after the vision_start
+    token, before any media token has been computed. The recompute must
+    treat this as the start of the current media segment instead of
+    searching for a (nonexistent) later vision_start and crashing.
+    """
+    from vllm.multimodal.evs import (
+        compute_mrope_for_media,
+        recompute_mrope_positions,
+    )
+
+    vision_start_id, image_id, video_id, text_id = 90, 91, 92, 1
+    merge_size = 2
+    size = (1, 8, 12)
+    n_tokens = (size[1] // merge_size) * (size[2] // merge_size)
+
+    mm_pos = (
+        compute_mrope_for_media(torch.tensor(size), merge_size)
+        .permute(1, 0)
+        .long()
+    )
+
+    prefix_len, suffix_len = 5, 7
+    input_ids = torch.tensor(
+        [text_id] * (prefix_len - 1)
+        + [vision_start_id]
+        + [image_id] * n_tokens
+        + [text_id] * suffix_len
+    )
+    total = input_ids.numel()
+    seed_positions = torch.arange(total).view(1, -1).expand(3, -1).clone().long()
+
+    # First chunk ended exactly at the vision_start boundary: prefix_len
+    # tokens computed (the last one being vision_start), zero media tokens.
+    positions, _ = recompute_mrope_positions(
+        input_ids,
+        [mm_pos],
+        seed_positions,
+        num_computed_tokens=prefix_len,
+        vision_start_token_id=vision_start_id,
+        image_token_id=image_id,
+        video_token_id=video_id,
+    )
+
+    # Same result as computing in one shot from the beginning.
+    expected, _ = recompute_mrope_positions(
+        input_ids,
+        [mm_pos],
+        seed_positions.clone(),
+        num_computed_tokens=0,
+        vision_start_token_id=vision_start_id,
+        image_token_id=image_id,
+        video_token_id=video_id,
+    )
+    assert torch.equal(positions, expected)
+
+
 # --------------------------------------------------------------------------
 # HyDART (HIPRUNE_METHOD=hydart)
 # --------------------------------------------------------------------------

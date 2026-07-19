@@ -37,6 +37,64 @@ popular / random) as the HiPrune run. Raw log: `pope_summary.txt`.
 
 ![accuracy vs TTFT](pope_methods_tradeoff.png)
 
+## MME (full benchmark, 2,374 questions)
+
+`mme_eval.py` on the full lmms-lab/MME test split (yes/no questions,
+14 categories), official scoring: per category
+`score = 100 * (acc + acc+)`, perception = 10 categories (max 2000),
+cognition = 4 categories (max 800). Both methods answered the identical
+question set; the baseline row is method-independent. Raw logs and JSON:
+`mme_textvqa/mme_hydart/`, `mme_textvqa/mme_hiprune/`; paired stats:
+`mme_textvqa/benchmark_summary.txt`.
+
+| retention | HiPrune acc | HyDART acc | HiPrune perception | HyDART perception | HiPrune cognition | HyDART cognition | McNemar p |
+|-----------|-------------|------------|--------------------|-------------------|-------------------|------------------|-----------|
+| baseline  | —           | 0.849      | —                  | 1607.9            | —                 | 618.9            | —         |
+| 0.50      | 0.624       | 0.626      | 1159.9             | 1185.0            | 317.1             | 321.8            | 0.85      |
+| 0.30      | 0.655       | **0.676**  | 1170.4             | **1234.6**        | 203.2             | **302.1**        | **0.010** |
+| 0.14      | 0.596       | 0.605      | 984.0              | 1035.7            | 178.6             | 176.1            | 0.39      |
+
+- At 0.30 retention HyDART is +2.1 points accuracy, +64 perception and
+  +99 cognition, and the paired McNemar test is significant (p ≈ 0.010;
+  223 questions only HyDART got right vs 171 only HiPrune got right).
+  At 0.50 and 0.14 the two methods are statistically indistinguishable.
+- The per-category deltas (below) show HyDART's gains concentrate in
+  OCR, count, position, and text_translation — categories where
+  keeping *diverse* patches beats keeping low-attention registers.
+- Caveat: MME under pruning produces many empty/unparseable replies
+  (~20–25% at every pruned ratio, for both methods — mostly the
+  knowledge-heavy celebrity/artwork/landmark/scene categories, scored
+  as wrong here). Pruning hits MME much harder than POPE across the
+  board; the comparison between methods is still apples-to-apples.
+
+![MME comparison](mme_textvqa/mme_methods.png)
+
+![MME per-category deltas](mme_textvqa/mme_categories.png)
+
+## TextVQA (1,000 validation samples)
+
+`textvqa_eval.py` on a fixed-seed 1,000-question subset of the
+lmms-lab/textvqa validation split, standard VQA soft accuracy
+(`min(1, matches/3)` over 10 human answers). OCR-style questions are
+the worst case for token pruning: small text lives in exactly the
+patches pruning likes to drop. Raw logs: `mme_textvqa/textvqa_*`;
+paired bootstrap CIs: `mme_textvqa/benchmark_summary.txt`.
+
+| retention | HiPrune | HyDART | paired diff (95% CI) |
+|-----------|---------|--------|----------------------|
+| baseline  | —       | 0.802  | —                    |
+| 0.50      | 0.782   | 0.781  | −0.001 [−0.014, +0.013] |
+| 0.30      | 0.720   | **0.740** | +0.021 [−0.000, +0.042] |
+| 0.14      | 0.587   | **0.634** | **+0.047 [+0.018, +0.075]** |
+
+- Same shape as POPE: tied at 0.50, HyDART ahead at 0.30 (+2.1 points,
+  CI touching zero), and clearly ahead at 0.14 (+4.7 points, bootstrap
+  CI excludes zero).
+- Both methods hold up surprisingly well on TextVQA at 0.50 (−2 points
+  vs baseline) given the OCR sensitivity; the cliff is below 0.30.
+
+![TextVQA comparison](mme_textvqa/textvqa_methods.png)
+
 ## Lambda mini-grid
 
 POPE at 0.30 / 0.14 retention per (λ_seed, λ_pick) config, same 396

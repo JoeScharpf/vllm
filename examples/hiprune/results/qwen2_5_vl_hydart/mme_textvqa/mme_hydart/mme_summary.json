@@ -1,0 +1,343 @@
+{
+  "dataset": "lmms-lab/MME (test, full)",
+  "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "num_samples": 2374,
+  "results": [
+    {
+      "ratio": 1.0,
+      "num_samples": 2374,
+      "accuracy": 0.8487784330244313,
+      "invalid": 0,
+      "perception_score": 1607.9435774309723,
+      "cognition_score": 618.9285714285714,
+      "per_category": {
+        "OCR": {
+          "acc": 0.775,
+          "acc_plus": 0.55,
+          "score": 132.50000000000003
+        },
+        "artwork": {
+          "acc": 0.7975,
+          "acc_plus": 0.645,
+          "score": 144.25
+        },
+        "celebrity": {
+          "acc": 0.7911764705882353,
+          "acc_plus": 0.6176470588235294,
+          "score": 140.88235294117646
+        },
+        "code_reasoning": {
+          "acc": 0.85,
+          "acc_plus": 0.7,
+          "score": 154.99999999999997
+        },
+        "color": {
+          "acc": 0.9333333333333333,
+          "acc_plus": 0.8666666666666667,
+          "score": 180.0
+        },
+        "commonsense_reasoning": {
+          "acc": 0.7428571428571429,
+          "acc_plus": 0.5714285714285714,
+          "score": 131.42857142857142
+        },
+        "count": {
+          "acc": 0.85,
+          "acc_plus": 0.7333333333333333,
+          "score": 158.33333333333331
+        },
+        "existence": {
+          "acc": 0.9666666666666667,
+          "acc_plus": 0.9333333333333333,
+          "score": 190.0
+        },
+        "landmark": {
+          "acc": 0.9175,
+          "acc_plus": 0.84,
+          "score": 175.74999999999997
+        },
+        "numerical_calculation": {
+          "acc": 0.775,
+          "acc_plus": 0.55,
+          "score": 132.50000000000003
+        },
+        "position": {
+          "acc": 0.8666666666666667,
+          "acc_plus": 0.7333333333333333,
+          "score": 160.0
+        },
+        "posters": {
+          "acc": 0.8945578231292517,
+          "acc_plus": 0.8027210884353742,
+          "score": 169.7278911564626
+        },
+        "scene": {
+          "acc": 0.85,
+          "acc_plus": 0.715,
+          "score": 156.5
+        },
+        "text_translation": {
+          "acc": 1.0,
+          "acc_plus": 1.0,
+          "score": 200.0
+        }
+      },
+      "mean_prompt_tokens": 2171.3454085930916,
+      "mean_ttft_s": 0.055593161719540755,
+      "median_ttft_s": 0.05917645152658224,
+      "accuracy_pass_seconds": 559.2562533374876
+    },
+    {
+      "ratio": 0.5,
+      "num_samples": 2374,
+      "accuracy": 0.6263689974726201,
+      "invalid": 612,
+      "perception_score": 1185.001700680272,
+      "cognition_score": 321.7857142857142,
+      "per_category": {
+        "OCR": {
+          "acc": 0.575,
+          "acc_plus": 0.25,
+          "score": 82.5
+        },
+        "artwork": {
+          "acc": 0.595,
+          "acc_plus": 0.295,
+          "score": 88.99999999999999
+        },
+        "celebrity": {
+          "acc": 0.4823529411764706,
+          "acc_plus": 0.11764705882352941,
+          "score": 60.0
+        },
+        "code_reasoning": {
+          "acc": 0.425,
+          "acc_plus": 0.0,
+          "score": 42.5
+        },
+        "color": {
+          "acc": 0.9166666666666666,
+          "acc_plus": 0.8333333333333334,
+          "score": 175.0
+        },
+        "commonsense_reasoning": {
+          "acc": 0.5142857142857142,
+          "acc_plus": 0.22857142857142856,
+          "score": 74.28571428571428
+        },
+        "count": {
+          "acc": 0.85,
+          "acc_plus": 0.7666666666666667,
+          "score": 161.66666666666666
+        },
+        "existence": {
+          "acc": 0.9,
+          "acc_plus": 0.8333333333333334,
+          "score": 173.33333333333334
+        },
+        "landmark": {
+          "acc": 0.705,
+          "acc_plus": 0.44,
+          "score": 114.5
+        },
+        "numerical_calculation": {
+          "acc": 0.45,
+          "acc_plus": 0.05,
+          "score": 50.0
+        },
+        "position": {
+          "acc": 0.7666666666666667,
+          "acc_plus": 0.5666666666666667,
+          "score": 133.33333333333334
+        },
+        "posters": {
+          "acc": 0.6258503401360545,
+          "acc_plus": 0.3333333333333333,
+          "score": 95.91836734693877
+        },
+        "scene": {
+          "acc": 0.6225,
+          "acc_plus": 0.375,
+          "score": 99.75
+        },
+        "text_translation": {
+          "acc": 0.85,
+          "acc_plus": 0.7,
+          "score": 154.99999999999997
+        }
+      },
+      "mean_prompt_tokens": 1105.3117101937657,
+      "mean_ttft_s": 0.060728688010325035,
+      "median_ttft_s": 0.05619806284084916,
+      "accuracy_pass_seconds": 683.7978717070073
+    },
+    {
+      "ratio": 0.3,
+      "num_samples": 2374,
+      "accuracy": 0.6764953664700927,
+      "invalid": 483,
+      "perception_score": 1234.5703281312526,
+      "cognition_score": 302.14285714285717,
+      "per_category": {
+        "OCR": {
+          "acc": 0.6,
+          "acc_plus": 0.25,
+          "score": 85.0
+        },
+        "artwork": {
+          "acc": 0.605,
+          "acc_plus": 0.29,
+          "score": 89.5
+        },
+        "celebrity": {
+          "acc": 0.5529411764705883,
+          "acc_plus": 0.22941176470588234,
+          "score": 78.23529411764706
+        },
+        "code_reasoning": {
+          "acc": 0.35,
+          "acc_plus": 0.1,
+          "score": 44.99999999999999
+        },
+        "color": {
+          "acc": 0.8166666666666667,
+          "acc_plus": 0.6666666666666666,
+          "score": 148.33333333333334
+        },
+        "commonsense_reasoning": {
+          "acc": 0.4928571428571429,
+          "acc_plus": 0.22857142857142856,
+          "score": 72.14285714285714
+        },
+        "count": {
+          "acc": 0.7333333333333333,
+          "acc_plus": 0.5333333333333333,
+          "score": 126.66666666666666
+        },
+        "existence": {
+          "acc": 0.85,
+          "acc_plus": 0.7666666666666667,
+          "score": 161.66666666666666
+        },
+        "landmark": {
+          "acc": 0.74,
+          "acc_plus": 0.52,
+          "score": 126.0
+        },
+        "numerical_calculation": {
+          "acc": 0.425,
+          "acc_plus": 0.1,
+          "score": 52.5
+        },
+        "position": {
+          "acc": 0.8,
+          "acc_plus": 0.6666666666666666,
+          "score": 146.66666666666669
+        },
+        "posters": {
+          "acc": 0.7346938775510204,
+          "acc_plus": 0.5578231292517006,
+          "score": 129.2517006802721
+        },
+        "scene": {
+          "acc": 0.7925,
+          "acc_plus": 0.64,
+          "score": 143.25
+        },
+        "text_translation": {
+          "acc": 0.775,
+          "acc_plus": 0.55,
+          "score": 132.50000000000003
+        }
+      },
+      "mean_prompt_tokens": 678.9410278011794,
+      "mean_ttft_s": 0.05789090599864721,
+      "median_ttft_s": 0.05210610153153539,
+      "accuracy_pass_seconds": 624.4449629075825
+    },
+    {
+      "ratio": 0.14,
+      "num_samples": 2374,
+      "accuracy": 0.6048862679022746,
+      "invalid": 585,
+      "perception_score": 1035.6681672669067,
+      "cognition_score": 176.07142857142856,
+      "per_category": {
+        "OCR": {
+          "acc": 0.55,
+          "acc_plus": 0.15,
+          "score": 70.0
+        },
+        "artwork": {
+          "acc": 0.59,
+          "acc_plus": 0.29,
+          "score": 87.99999999999999
+        },
+        "celebrity": {
+          "acc": 0.5941176470588235,
+          "acc_plus": 0.31176470588235294,
+          "score": 90.58823529411765
+        },
+        "code_reasoning": {
+          "acc": 0.25,
+          "acc_plus": 0.05,
+          "score": 30.0
+        },
+        "color": {
+          "acc": 0.65,
+          "acc_plus": 0.4,
+          "score": 105.0
+        },
+        "commonsense_reasoning": {
+          "acc": 0.4857142857142857,
+          "acc_plus": 0.2,
+          "score": 68.57142857142857
+        },
+        "count": {
+          "acc": 0.65,
+          "acc_plus": 0.43333333333333335,
+          "score": 108.33333333333334
+        },
+        "existence": {
+          "acc": 0.75,
+          "acc_plus": 0.5666666666666667,
+          "score": 131.66666666666666
+        },
+        "landmark": {
+          "acc": 0.6775,
+          "acc_plus": 0.41,
+          "score": 108.74999999999999
+        },
+        "numerical_calculation": {
+          "acc": 0.25,
+          "acc_plus": 0.0,
+          "score": 25.0
+        },
+        "position": {
+          "acc": 0.75,
+          "acc_plus": 0.5666666666666667,
+          "score": 131.66666666666666
+        },
+        "posters": {
+          "acc": 0.6530612244897959,
+          "acc_plus": 0.42857142857142855,
+          "score": 108.16326530612244
+        },
+        "scene": {
+          "acc": 0.595,
+          "acc_plus": 0.34,
+          "score": 93.5
+        },
+        "text_translation": {
+          "acc": 0.475,
+          "acc_plus": 0.05,
+          "score": 52.5
+        }
+      },
+      "mean_prompt_tokens": 337.7211457455771,
+      "mean_ttft_s": 0.05505485584338506,
+      "median_ttft_s": 0.05024952860549092,
+      "accuracy_pass_seconds": 583.7056278828532
+    }
+  ]
+}
