@@ -60,6 +60,11 @@ GEMMA4_OBJECT_LAYER = 8
 # the middle layer, matching the authors' released Qwen2.5-VL configuration
 # (HIPRUNE_OBJECT_LAYER=16); the deep layer is the last (32nd) block.
 QWEN2_5_VL_OBJECT_LAYER = 16
+# Object layer (1-based) for LLaVA-1.5's 24-layer CLIP vision encoder,
+# from the paper's released LLaVA configuration. The deep layer is the
+# feature-select layer (-2, i.e. the 23rd block — the last one vLLM
+# loads, since the tower is truncated at the feature layer).
+LLAVA_OBJECT_LAYER = 9
 DEFAULT_ALPHA = 0.1
 
 # HyDART MMR penalties (see hydart_select). lambda_seed penalizes

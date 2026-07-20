@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from vllm.multimodal.hiprune import (
+    LLAVA_OBJECT_LAYER,
     QWEN2_5_VL_OBJECT_LAYER,
     aggregate_patch_attention,
     build_hiprune_metadata,
@@ -455,6 +456,118 @@ def test_recompute_mrope_chunk_boundary_after_vision_start():
         video_token_id=video_id,
     )
     assert torch.equal(positions, expected)
+
+
+# --------------------------------------------------------------------------
+# LLaVA-1.5 support (CLIP tower: 24x24 grid + CLS token)
+# --------------------------------------------------------------------------
+
+LLAVA_GRID = 24
+LLAVA_N_TOKENS = LLAVA_GRID * LLAVA_GRID  # 576
+LLAVA_SEQ_LEN = LLAVA_N_TOKENS + 1  # + CLS at index 0
+
+
+@pytest.mark.parametrize("seed", range(5))
+@pytest.mark.parametrize("ratio", [0.111, 0.223, 0.5])
+def test_llava_pipeline_matches_reference(seed: int, ratio: float):
+    """Differential test against the transformers-wrapper reference
+    (llava_server.py / the authors' llava_arch.py): given the same
+    post-softmax attention matrices over the full CLIP sequence (CLS at
+    index 0), per-key aggregation + CLS-key stripping + selection must
+    keep exactly the same token set, split into the same categories.
+    """
+    g = torch.Generator().manual_seed(seed)
+    num_heads = 4
+
+    def rand_attn():
+        return torch.rand(
+            num_heads, LLAVA_SEQ_LEN, LLAVA_SEQ_LEN, generator=g
+        ).softmax(dim=-1)
+
+    attn_shallow = rand_attn()
+    attn_deep = rand_attn()
+
+    # ---- Reference (llava_server.py): mean heads, mean queries, drop CLS
+    ref_shallow = attn_shallow.mean(dim=0).mean(dim=0)[1:]
+    ref_deep = attn_deep.mean(dim=0).mean(dim=0)[1:].clone()
+
+    budget = compute_retained_tokens_count(LLAVA_N_TOKENS, ratio)
+    shallow_token_num = round(budget * 0.1 / 5)
+    anchor_ref = torch.topk(ref_shallow, k=shallow_token_num).indices
+    shallow_all = torch.cat(
+        [
+            anchor_ref,
+            anchor_ref - 1,
+            anchor_ref + 1,
+            anchor_ref - LLAVA_GRID,
+            anchor_ref + LLAVA_GRID,
+        ]
+    ).clamp(0, LLAVA_N_TOKENS - 1)
+    shallow_all = torch.unique(shallow_all, sorted=False)
+    deep_token_num = budget - shallow_all.shape[0]
+    avail = torch.zeros(LLAVA_N_TOKENS, dtype=torch.bool)
+    avail.scatter_(0, shallow_all, 1)
+    ref_deep -= avail.int()
+    deep_idx = torch.topk(ref_deep, k=deep_token_num).indices
+    ref_mask = torch.zeros(LLAVA_N_TOKENS, dtype=torch.bool)
+    ref_mask[torch.cat([shallow_all, deep_idx])] = True
+    # ---------------------------------------------------------------------
+
+    # Our pipeline: per-key scores over the FULL sequence (what
+    # compute_hiprune_key_scores returns), CLS key stripped by the model,
+    # then hiprune_select.
+    shallow = attn_shallow.mean(dim=0).mean(dim=0)[1:]
+    deep = attn_deep.mean(dim=0).mean(dim=0)[1:]
+
+    anchor, buffer, register, kept = hiprune_select(
+        shallow, deep, LLAVA_N_TOKENS, LLAVA_GRID, ratio
+    )
+    assert torch.equal(kept, ref_mask)
+    assert set(torch.cat([anchor, buffer]).tolist()) == set(shallow_all.tolist())
+    assert set(register.tolist()) == set(deep_idx.tolist())
+
+
+@pytest.mark.parametrize("ratio", [0.111, 0.223])
+def test_llava_budget_matches_placeholders(ratio: float):
+    """The model keeps exactly the count the processor promised via the
+    shrunken placeholder run (576-token LLaVA grid)."""
+    torch.manual_seed(0)
+    shallow = torch.rand(LLAVA_N_TOKENS).softmax(dim=0)
+    deep = torch.rand(LLAVA_N_TOKENS).softmax(dim=0)
+    _, _, _, kept = hiprune_select(shallow, deep, LLAVA_N_TOKENS, LLAVA_GRID, ratio)
+    assert kept.sum().item() == compute_retained_tokens_count(LLAVA_N_TOKENS, ratio)
+
+    emb = torch.randn(LLAVA_N_TOKENS, 32)
+    _, _, _, kept_hd, _ = hydart_select(
+        shallow, emb, LLAVA_N_TOKENS, LLAVA_GRID, ratio
+    )
+    assert kept_hd.sum().item() == compute_retained_tokens_count(
+        LLAVA_N_TOKENS, ratio
+    )
+
+
+def test_llava_metadata_object_layer():
+    torch.manual_seed(6)
+    shallow = torch.rand(LLAVA_N_TOKENS).softmax(dim=0)
+    deep = torch.rand(LLAVA_N_TOKENS).softmax(dim=0)
+    anchor, buffer, register, kept = hiprune_select(
+        shallow, deep, LLAVA_N_TOKENS, LLAVA_GRID, 0.223
+    )
+    md = build_hiprune_metadata(
+        anchor,
+        buffer,
+        register,
+        kept,
+        shallow,
+        deep,
+        LLAVA_GRID,
+        LLAVA_GRID,
+        0.223,
+        object_layer=LLAVA_OBJECT_LAYER,
+    )
+    assert md["object_layer"] == LLAVA_OBJECT_LAYER
+    assert md["grid"] == [LLAVA_GRID, LLAVA_GRID]
+    assert md["num_tokens"] == LLAVA_N_TOKENS
 
 
 # --------------------------------------------------------------------------
