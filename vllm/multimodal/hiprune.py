@@ -488,6 +488,11 @@ def build_hydart_metadata(
             "diverse_at_selection": _mean(sim_stats, diverse_idx),
             "pruned_vs_kept": _mean(sim_stats, pruned_idx),
         },
+        # Per-token arrays for hover tooltips (index = soft-token index).
+        "scores": {
+            "object_layer": shallow_scores.float().tolist(),
+            "similarity": sim_stats.float().tolist(),
+        },
     }
 
 
@@ -543,5 +548,10 @@ def build_hiprune_metadata(
             "deep_layer": {
                 name: _mean(deep_scores, idx) for name, idx in categories.items()
             },
+        },
+        # Per-token arrays for hover tooltips (index = soft-token index).
+        "scores": {
+            "object_layer": shallow_scores.float().tolist(),
+            "deep_layer": deep_scores.float().tolist(),
         },
     }
