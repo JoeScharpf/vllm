@@ -48,10 +48,14 @@ from vllm.multimodal.hiprune import (
     GEMMA4_OBJECT_LAYER,
     aggregate_patch_attention,
     build_hiprune_metadata,
+    build_hydart_metadata,
     compute_retained_tokens_count,
     compute_soft_token_grid,
+    get_hiprune_method,
     get_hiprune_ratio as _get_hiprune_ratio,
+    get_hydart_lambdas,
     hiprune_select,
+    hydart_select,
 )
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -1404,12 +1408,13 @@ class Gemma4ForConditionalGeneration(
         applied over a single concatenated tensor for all images.
 
         When a ``hiprune_ratio`` is attached to an image, the pooled
-        soft tokens are pruned with HiPrune selection: attention is
-        captured from the object and last encoder layers, aggregated
-        onto soft tokens with the pooler's kernel arithmetic, and only
-        the selected tokens are returned. The kept count matches the
-        placeholder count the processor emitted (both sides use
-        ``compute_retained_tokens_count``).
+        soft tokens are pruned with HiPrune selection (or HyDART when
+        ``HIPRUNE_METHOD=hydart``): attention is captured from the
+        object layer (and, for HiPrune, the last encoder layer),
+        aggregated onto soft tokens with the pooler's kernel
+        arithmetic, and only the selected tokens are returned. The kept
+        count matches the placeholder count the processor emitted (both
+        sides use ``compute_retained_tokens_count``).
         """
         pixel_values = image_input["pixel_values"]
         pixel_position_ids = image_input["pixel_position_ids"]
@@ -1436,10 +1441,18 @@ class Gemma4ForConditionalGeneration(
             for idx in range(total_images):
                 ratio = float(hp_field[idx])
                 ratios[idx] = ratio if ratio < 1.0 else None
-        capture_layer_idxs = (
-            GEMMA4_OBJECT_LAYER - 1,
-            len(vt.encoder.layers) - 1,
-        )
+        # HyDART needs only the object-layer scores (its diverse fill uses
+        # embedding similarity, not deep attention). Skipping the last
+        # layer halves the eager-attention capture cost, which on Gemma
+        # materializes full (heads, patches, patches) matrices per layer.
+        method = get_hiprune_method()
+        if method == "hydart":
+            capture_layer_idxs: tuple[int, ...] = (GEMMA4_OBJECT_LAYER - 1,)
+        else:
+            capture_layer_idxs = (
+                GEMMA4_OBJECT_LAYER - 1,
+                len(vt.encoder.layers) - 1,
+            )
 
         for idx in range(total_images):
             pv = pixel_values[idx]
@@ -1450,8 +1463,11 @@ class Gemma4ForConditionalGeneration(
         # free memory per bucket because the previous bucket's encoder
         # pass has already allocated activations we should account for.
         last_hidden_states_map: dict[int, torch.Tensor] = {}
-        # orig_idx -> (shallow_scores, deep_scores, grid_w, grid_h)
-        hiprune_scores_map: dict[int, tuple[torch.Tensor, torch.Tensor, int, int]] = {}
+        # orig_idx -> (shallow_scores, deep_scores or None, grid_w, grid_h);
+        # deep is None under HyDART, which captures only the object layer.
+        hiprune_scores_map: dict[
+            int, tuple[torch.Tensor, torch.Tensor | None, int, int]
+        ] = {}
         for patches, items in buckets.items():
             free, total = torch.accelerator.get_memory_info()
             max_batch_size = min(
@@ -1516,12 +1532,15 @@ class Gemma4ForConditionalGeneration(
                             kernel_idx,
                             num_soft,
                         )
-                        deep = aggregate_patch_attention(
-                            attn_by_layer[capture_layer_idxs[1]][i],
-                            valid,
-                            kernel_idx,
-                            num_soft,
-                        )
+                        if len(capture_layer_idxs) > 1:
+                            deep = aggregate_patch_attention(
+                                attn_by_layer[capture_layer_idxs[1]][i],
+                                valid,
+                                kernel_idx,
+                                num_soft,
+                            )
+                        else:
+                            deep = None
                         hiprune_scores_map[orig_idx] = (shallow, deep, grid_w, grid_h)
                     del attn_by_layer
                 else:
@@ -1567,21 +1586,58 @@ class Gemma4ForConditionalGeneration(
                     f"HiPrune score length {shallow.shape[0]} != pooled "
                     f"soft-token count {num_soft}"
                 )
-                anchor_idx, buffer_idx, register_idx, kept_mask = hiprune_select(
-                    shallow, deep, num_soft, grid_w, ratio
-                )
-                valid_states = valid_states[kept_mask]
-                hiprune_metadata[orig_idx] = build_hiprune_metadata(
-                    anchor_idx,
-                    buffer_idx,
-                    register_idx,
-                    kept_mask,
-                    shallow,
-                    deep,
-                    grid_w,
-                    grid_h,
-                    ratio,
-                )
+                if method == "hydart":
+                    lambda_seed, lambda_pick = get_hydart_lambdas()
+                    # HyDART's MMR similarity runs over the embeddings the
+                    # LM consumes, so project this image's soft tokens now.
+                    # (The kept ones are projected again in the batched
+                    # call below — a negligible extra linear pass.)
+                    lm_embeds = self.embed_vision(
+                        inputs_embeds=valid_states.to(self.model_dtype).unsqueeze(0)
+                    ).squeeze(0)
+                    anchor_idx, buffer_idx, diverse_idx, kept_mask, sim_stats = (
+                        hydart_select(
+                            shallow,
+                            lm_embeds,
+                            num_soft,
+                            grid_w,
+                            ratio,
+                            lambda_seed=lambda_seed,
+                            lambda_pick=lambda_pick,
+                        )
+                    )
+                    valid_states = valid_states[kept_mask]
+                    hiprune_metadata[orig_idx] = build_hydart_metadata(
+                        anchor_idx,
+                        buffer_idx,
+                        diverse_idx,
+                        kept_mask,
+                        shallow,
+                        sim_stats,
+                        grid_w,
+                        grid_h,
+                        ratio,
+                        object_layer=GEMMA4_OBJECT_LAYER,
+                        lambda_seed=lambda_seed,
+                        lambda_pick=lambda_pick,
+                    )
+                else:
+                    assert deep is not None
+                    anchor_idx, buffer_idx, register_idx, kept_mask = hiprune_select(
+                        shallow, deep, num_soft, grid_w, ratio
+                    )
+                    valid_states = valid_states[kept_mask]
+                    hiprune_metadata[orig_idx] = build_hiprune_metadata(
+                        anchor_idx,
+                        buffer_idx,
+                        register_idx,
+                        kept_mask,
+                        shallow,
+                        deep,
+                        grid_w,
+                        grid_h,
+                        ratio,
+                    )
 
             all_valid_states[orig_idx] = valid_states
             valid_lens[orig_idx] = valid_states.shape[0]
