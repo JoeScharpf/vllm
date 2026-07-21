@@ -52,6 +52,7 @@ from vllm.multimodal.hiprune import (
     build_hiprune_metadata,
     build_hiprune_pp_metadata,
     build_hydart_metadata,
+    build_nprune_metadata,
     compute_hiprune_pp_budget,
     compute_retained_tokens_count,
     compute_soft_token_grid,
@@ -63,9 +64,12 @@ from vllm.multimodal.hiprune import (
     get_hiprune_pp_beta,
     get_hiprune_prompt as _get_hiprune_prompt,
     get_hiprune_ratio as _get_hiprune_ratio,
+    get_nprune_stride,
     hiprune_pp_select,
     hiprune_select,
     hydart_select,
+    nprune_keep_count,
+    nprune_select,
     pack_hiprune_config,
     unpack_hiprune_config,
     HIPRUNE_MM_KWARG_KEYS,
@@ -165,6 +169,7 @@ def _shrink_image_token_runs(
     image_token_id: int,
     hiprune_ratio: float,
     hiprune_kwargs: Mapping[str, object] | None = None,
+    keep_counts: list[int] | None = None,
 ) -> torch.Tensor:
     """Shrink each contiguous run of image placeholder tokens to the
     HiPrune retained-token budget.
@@ -180,11 +185,16 @@ def _shrink_image_token_runs(
         input_ids: ``(1, seq_len)`` token IDs from the HF processor.
         image_token_id: The ``<|image|>`` placeholder token ID.
         hiprune_ratio: Retention ratio in ``(0, 1)``.
+        keep_counts: Explicit per-run kept counts, in prompt order.
+            Used by NPrune, whose count is a function of the grid
+            *shape* (derived from ``pixel_position_ids``), not of the
+            run length. ``None``: count-only ``_hiprune_keep_count``.
     """
     ids = input_ids[0]
     is_img = ids == image_token_id
     keep = torch.ones_like(ids, dtype=torch.bool)
 
+    run_index = 0
     run_start = None
     for pos in range(len(ids) + 1):
         inside = pos < len(ids) and bool(is_img[pos])
@@ -192,10 +202,29 @@ def _shrink_image_token_runs(
             run_start = pos
         elif not inside and run_start is not None:
             run_len = pos - run_start
-            kept = _hiprune_keep_count(run_len, hiprune_ratio, hiprune_kwargs)
+            if keep_counts is not None:
+                if run_index >= len(keep_counts):
+                    raise ValueError(
+                        f"{len(keep_counts)} per-image keep counts but "
+                        f"more image-token runs in the prompt"
+                    )
+                kept = keep_counts[run_index]
+                if kept > run_len:
+                    raise ValueError(
+                        f"keep count {kept} exceeds image-token run "
+                        f"length {run_len}"
+                    )
+            else:
+                kept = _hiprune_keep_count(run_len, hiprune_ratio, hiprune_kwargs)
             keep[run_start + kept : pos] = False
             run_start = None
+            run_index += 1
 
+    if keep_counts is not None and run_index != len(keep_counts):
+        raise ValueError(
+            f"{len(keep_counts)} per-image keep counts but only "
+            f"{run_index} image-token runs in the prompt"
+        )
     return ids[keep].unsqueeze(0)
 
 
@@ -252,7 +281,7 @@ class Gemma4ImagePixelInputs(TensorSchema):
     # span requests with different methods.
     hiprune_config: Annotated[
         torch.Tensor | list[torch.Tensor] | None,
-        TensorShape("bn", 6),
+        TensorShape("bn", 7),
     ] = None
 
 
@@ -395,6 +424,40 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
             kwargs["target_sr"] = processor.feature_extractor.sampling_rate
         return MultiModalDataParser(**kwargs)
 
+    def _compute_soft_token_grid_dims(
+        self,
+        image_width: int,
+        image_height: int,
+        max_soft_tokens: int | None = None,
+    ) -> tuple[int, int]:
+        """Soft-token grid shape ``(grid_h, grid_w)`` for an image.
+
+        The same resize arithmetic as the HF Gemma 4 image processor
+        (which is what makes :meth:`_compute_num_soft_tokens` agree with
+        the encoder output), so on the model side
+        ``compute_soft_token_grid`` over the real ``pixel_position_ids``
+        derives the identical shape. Needed by NPrune, whose keep count
+        is a function of the grid shape rather than the token count.
+
+        Note: for extreme aspect ratios the product can overshoot
+        ``max_soft_tokens`` (the HF processor caps its output there);
+        callers that need the exact shape must check for that case.
+        """
+        vision_cfg = self.get_hf_config().vision_config
+        patch_size = vision_cfg.patch_size
+        pooling_kernel_size = vision_cfg.pooling_kernel_size
+
+        if max_soft_tokens is None:
+            max_soft_tokens = vision_cfg.default_output_length
+
+        unit = patch_size * pooling_kernel_size
+        max_patches = max_soft_tokens * pooling_kernel_size**2
+        num_patches_orig = (image_height / patch_size) * (image_width / patch_size)
+        scale = math.sqrt(max_patches / num_patches_orig)
+        target_h = max(unit, int(math.floor(image_height * scale / unit)) * unit)
+        target_w = max(unit, int(math.floor(image_width * scale / unit)) * unit)
+        return target_h // unit, target_w // unit
+
     def _compute_num_soft_tokens(
         self,
         image_width: int,
@@ -410,19 +473,12 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
                 the model config is used.
         """
         vision_cfg = self.get_hf_config().vision_config
-        patch_size = vision_cfg.patch_size
-        pooling_kernel_size = vision_cfg.pooling_kernel_size
-
         if max_soft_tokens is None:
             max_soft_tokens = vision_cfg.default_output_length
 
-        unit = patch_size * pooling_kernel_size
-        max_patches = max_soft_tokens * pooling_kernel_size**2
-        num_patches_orig = (image_height / patch_size) * (image_width / patch_size)
-        scale = math.sqrt(max_patches / num_patches_orig)
-        target_h = max(unit, int(math.floor(image_height * scale / unit)) * unit)
-        target_w = max(unit, int(math.floor(image_width * scale / unit)) * unit)
-        num_patches = (target_h // patch_size) * (target_w // patch_size)
+        grid_h, grid_w = self._compute_soft_token_grid_dims(
+            image_width, image_height, max_soft_tokens=max_soft_tokens
+        )
         # Clamp to ``max_soft_tokens``: extreme aspect ratios (e.g. 3x900)
         # cause the floor() above to round one dim up to ``unit`` while the
         # other scales freely, which over-shoots ``max_patches``. The HF
@@ -430,7 +486,7 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
         # ``max_soft_tokens``, so without this clamp the prompt-side
         # placeholder count exceeds the encoder output and
         # ``_merge_multimodal_embeddings`` crashes.
-        return min(num_patches // (pooling_kernel_size**2), max_soft_tokens)
+        return min(grid_h * grid_w, max_soft_tokens)
 
     def get_image_repl(
         self,
@@ -466,7 +522,28 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
             max_soft_tokens=max_soft_tokens,
         )
         if hiprune_ratio is not None:
-            num_soft = _hiprune_keep_count(num_soft, hiprune_ratio, hiprune_kwargs)
+            if get_hiprune_method(hiprune_kwargs) == "nprune":
+                # Grid-shape-aware count (exact lattice). The shape from
+                # the resize arithmetic matches the model's
+                # compute_soft_token_grid on the real pixel positions —
+                # unless the extreme-aspect clamp fired, in which case
+                # the true grid shape is unknowable here.
+                grid_h, grid_w = self._compute_soft_token_grid_dims(
+                    image_width, image_height, max_soft_tokens=max_soft_tokens
+                )
+                if grid_h * grid_w != num_soft:
+                    raise ValueError(
+                        "nprune does not support extreme aspect-ratio "
+                        f"images on Gemma (grid {grid_h}x{grid_w} clamped "
+                        f"to {num_soft} soft tokens)"
+                    )
+                num_soft = nprune_keep_count(
+                    grid_h, grid_w, get_nprune_stride(hiprune_kwargs)
+                )
+            else:
+                num_soft = _hiprune_keep_count(
+                    num_soft, hiprune_ratio, hiprune_kwargs
+                )
         config = self.get_hf_config()
         token_ids = (
             [config.boi_token_id]
@@ -910,6 +987,30 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
                 [ids], dtype=torch.long
             ).repeat(num_images, 1)
 
+            # NPrune: the keep count is a function of the grid *shape*,
+            # which the run length alone cannot provide. Derive each
+            # image's grid from its real pixel_position_ids with the
+            # same helper the model side uses (compute_soft_token_grid)
+            # — the strongest possible parity guarantee.
+            keep_counts: list[int] | None = None
+            if get_hiprune_method(merged_kwargs) == "nprune":
+                stride = get_nprune_stride(merged_kwargs)
+                pooling_k = (
+                    self.info.get_hf_config().vision_config.pooling_kernel_size
+                )
+                pp = processed_outputs["pixel_position_ids"]
+                keep_counts = []
+                for i in range(num_images):
+                    pp_i = pp[i]
+                    if not isinstance(pp_i, torch.Tensor):
+                        pp_i = torch.tensor(pp_i)
+                    _, grid_w, grid_h, _ = compute_soft_token_grid(
+                        pp_i, pooling_k
+                    )
+                    keep_counts.append(
+                        nprune_keep_count(grid_h, grid_w, stride)
+                    )
+
             processor = self.info.get_hf_processor()
             input_ids = processed_outputs["input_ids"]
             if not isinstance(input_ids, torch.Tensor):
@@ -919,6 +1020,7 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
                 processor.image_token_id,
                 hiprune_ratio,
                 merged_kwargs,
+                keep_counts=keep_counts,
             )
 
         if "input_features" in processed_outputs:
@@ -1622,8 +1724,10 @@ class Gemma4ForConditionalGeneration(
                     if ratios[chunk_items[0][0]] is not None
                     else None
                 )
-                chunk_needs_pruning = (
-                    pruned_cfg is not None and pruned_cfg.method != "dart"
+                # NPrune needs no attention either: its selection is a
+                # deterministic lattice over the soft-token grid.
+                chunk_needs_pruning = pruned_cfg is not None and (
+                    pruned_cfg.method not in ("dart", "nprune")
                 )
                 if chunk_needs_pruning:
                     if pruned_cfg.method == "hydart":
@@ -1785,6 +1889,26 @@ class Gemma4ForConditionalGeneration(
                     pivot_text=p_txt,
                     num_text_pivots=int(txt_piv.numel()),
                     dart_layer=dart_layer,
+                )
+            elif ratio is not None and method == "nprune":
+                # NPrune: pure uniform-lattice sampling — no attention,
+                # no LM-space projection, no prompt. Prunes valid_states
+                # directly, the same soft-token sequence the other
+                # methods prune.
+                _, grid_w, grid_h, _ = compute_soft_token_grid(
+                    pixel_position_ids[orig_idx], pooling_k
+                )
+                num_soft = valid_states.shape[0]
+                assert grid_w * grid_h == num_soft, (
+                    f"soft-token grid {grid_w}x{grid_h} != pooled "
+                    f"soft-token count {num_soft}"
+                )
+                kept_idx, kept_mask = nprune_select(
+                    grid_h, grid_w, cfg.stride, device=valid_states.device
+                )
+                valid_states = valid_states[kept_mask]
+                hiprune_metadata[orig_idx] = build_nprune_metadata(
+                    kept_idx, kept_mask, grid_w, grid_h, cfg.stride
                 )
             elif ratio is not None:
                 shallow, deep, grid_w, grid_h = hiprune_scores_map[orig_idx]

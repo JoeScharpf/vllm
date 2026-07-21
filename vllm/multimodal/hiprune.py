@@ -107,6 +107,12 @@ DEFAULT_DART_PIVOT_IMAGE = 4
 DEFAULT_DART_PIVOT_TEXT = 4
 DEFAULT_DART_LAYER = 2
 
+# NPrune (naive uniform spatial pruning) lattice stride. Stride 2 keeps
+# the upper-left token of every 2x2 block (~25% retained). Stride 1 is
+# a no-op and is mapped to the no-pruning path by callers.
+DEFAULT_NPRUNE_STRIDE = 2
+NPRUNE_ALLOWED_STRIDES = (1, 2)
+
 
 def get_hiprune_method(merged_kwargs: Mapping[str, object] | None = None) -> str:
     """Selection method for ``--enable-hiprune`` servers.
@@ -115,16 +121,16 @@ def get_hiprune_method(merged_kwargs: Mapping[str, object] | None = None) -> str
     (attached by the API layer from the ``token_pruning_method`` chat
     field), falling back to the ``HIPRUNE_METHOD`` env var so
     env-configured servers and scripts keep working. One of ``hiprune``
-    (default), ``hydart``, ``hiprune_pp`` or ``dart``.
+    (default), ``hydart``, ``hiprune_pp``, ``dart`` or ``nprune``.
     """
     val = merged_kwargs.get("hiprune_method") if merged_kwargs else None
     if val is None:
         val = os.environ.get("HIPRUNE_METHOD", "hiprune")
     method = str(val).lower()
-    if method not in ("hiprune", "hydart", "hiprune_pp", "dart"):
+    if method not in ("hiprune", "hydart", "hiprune_pp", "dart", "nprune"):
         raise ValueError(
-            "hiprune method must be 'hiprune', 'hydart', 'hiprune_pp' or "
-            f"'dart', got {method!r}"
+            "hiprune method must be 'hiprune', 'hydart', 'hiprune_pp', "
+            f"'dart' or 'nprune', got {method!r}"
         )
     return method
 
@@ -199,6 +205,25 @@ def get_hydart_lambdas(
     return float(seed_val), float(pick_val)  # type: ignore[arg-type]
 
 
+def get_nprune_stride(merged_kwargs: Mapping[str, object] | None = None) -> int:
+    """NPrune lattice stride.
+
+    Per-request ``hiprune_stride`` mm kwarg, else ``HIPRUNE_NPRUNE_STRIDE``
+    env, else 2. Restricted to {1, 2} for the MVP (the lattice math is
+    general; widening later is a validation change here only).
+    """
+    val = merged_kwargs.get("hiprune_stride") if merged_kwargs else None
+    if val is None:
+        val = os.environ.get("HIPRUNE_NPRUNE_STRIDE", DEFAULT_NPRUNE_STRIDE)
+    stride = int(float(val))  # type: ignore[arg-type]
+    if stride not in NPRUNE_ALLOWED_STRIDES:
+        raise ValueError(
+            f"nprune stride must be one of {NPRUNE_ALLOWED_STRIDES}, "
+            f"got {stride}"
+        )
+    return stride
+
+
 # All vLLM-side pruning keys that may appear in mm_processor_kwargs.
 # Model processors strip these before calling the HF processor.
 HIPRUNE_MM_KWARG_KEYS = (
@@ -210,6 +235,7 @@ HIPRUNE_MM_KWARG_KEYS = (
     "hiprune_beta",
     "hiprune_pivot_image",
     "hiprune_pivot_text",
+    "hiprune_stride",
 )
 
 # Method <-> id mapping for the packed per-image config tensor (mm
@@ -219,12 +245,13 @@ HIPRUNE_METHOD_IDS: dict[str, int] = {
     "hydart": 1,
     "hiprune_pp": 2,
     "dart": 3,
+    "nprune": 4,
 }
 _HIPRUNE_ID_METHODS = {v: k for k, v in HIPRUNE_METHOD_IDS.items()}
 
 # Row layout of the packed config: (method_id, lambda_seed, lambda_pick,
-# beta, pivot_image, pivot_text).
-HIPRUNE_CONFIG_WIDTH = 6
+# beta, pivot_image, pivot_text, stride).
+HIPRUNE_CONFIG_WIDTH = 7
 
 
 @dataclass(frozen=True)
@@ -237,6 +264,7 @@ class HipruneConfig:
     beta: float
     pivot_image: int
     pivot_text: int
+    stride: int
 
 
 def pack_hiprune_config(
@@ -253,6 +281,7 @@ def pack_hiprune_config(
     lambda_seed, lambda_pick = get_hydart_lambdas(merged_kwargs)
     beta = get_hiprune_pp_beta(merged_kwargs)
     pivot_image, pivot_text = get_dart_pivots(merged_kwargs)
+    stride = get_nprune_stride(merged_kwargs)
     return torch.tensor(
         [
             float(HIPRUNE_METHOD_IDS[method]),
@@ -261,6 +290,7 @@ def pack_hiprune_config(
             beta,
             float(pivot_image),
             float(pivot_text),
+            float(stride),
         ],
         dtype=torch.float32,
     )
@@ -286,6 +316,7 @@ def unpack_hiprune_config(row: torch.Tensor | None) -> HipruneConfig:
         beta=vals[3],
         pivot_image=int(round(vals[4])),
         pivot_text=int(round(vals[5])),
+        stride=int(round(vals[6])),
     )
 
 
@@ -377,6 +408,56 @@ def compute_hiprune_pp_budget(
     base = compute_retained_tokens_count(num_tokens, pruning_ratio)
     t_sum = round(base * beta)
     return base, max(0, min(t_sum, num_tokens - base))
+
+
+def nprune_keep_count(grid_h: int, grid_w: int, stride: int) -> int:
+    """Number of soft tokens NPrune keeps: the exact uniform-lattice count.
+
+    ``ceil(grid_h / stride) * ceil(grid_w / stride)`` — the size of
+    ``grid[::stride, ::stride]``, exact on odd grids too (a 3x3 grid at
+    stride 2 keeps the 4 corner tokens, 44.4% actual retention). Unlike
+    the other methods' budgets this is a function of the grid *shape*,
+    not the token count, so every placeholder-sizing site must derive
+    real grid dims. Called by both the multimodal processor (placeholder
+    sizing) and :func:`nprune_select`, so the two can never disagree.
+    """
+    return -(-grid_h // stride) * (-(-grid_w // stride))
+
+
+def nprune_select(
+    grid_h: int,
+    grid_w: int,
+    stride: int,
+    device: torch.device | str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """NPrune: naive uniform spatial pruning (content- and prompt-free).
+
+    Keeps the upper-left token of every ``stride x stride`` block — the
+    uniform lattice of raster-order indices ``i = r * grid_w + c`` for
+    ``r, c`` multiples of ``stride``. Samples the 2D grid, not every
+    s-th token of the flattened sequence. No attention, no similarity,
+    no scores: this is the deterministic control baseline the
+    content-aware methods should have to beat.
+
+    Args:
+        grid_h / grid_w: soft-token grid shape (raster order, row-major).
+        stride: lattice stride; 2 keeps ~25% (exactly 25% when both
+            dims are even). Stride 1 keeps everything (serving paths
+            map it to the no-pruning path; supported here for tests).
+        device: device for the returned tensors.
+
+    Returns:
+        ``(kept_idx, kept_mask)`` over ``grid_h * grid_w`` raster-order
+        soft tokens; ``kept_idx`` is ascending. ``kept_mask.sum()``
+        equals :func:`nprune_keep_count` by construction (asserted).
+    """
+    rows = torch.arange(0, grid_h, stride, device=device)
+    cols = torch.arange(0, grid_w, stride, device=device)
+    kept_idx = (rows.unsqueeze(1) * grid_w + cols.unsqueeze(0)).reshape(-1)
+    kept_mask = torch.zeros(grid_h * grid_w, dtype=torch.bool, device=device)
+    kept_mask[kept_idx] = True
+    assert int(kept_mask.sum()) == nprune_keep_count(grid_h, grid_w, stride)
+    return kept_idx, kept_mask
 
 
 def dart_keep_count(
@@ -1205,4 +1286,32 @@ def build_hiprune_metadata(
             "object_layer": shallow_scores.float().tolist(),
             "deep_layer": deep_scores.float().tolist(),
         },
+    }
+
+
+def build_nprune_metadata(
+    kept_idx: torch.Tensor,
+    kept_mask: torch.Tensor,
+    grid_w: int,
+    grid_h: int,
+    stride: int,
+) -> dict[str, object]:
+    """JSON-safe per-image NPrune metadata for API reporting.
+
+    NPrune has no scores of any kind (no attention, no similarity), so
+    the metadata is just the uniform-lattice index sets. ``retention``
+    is the *actual* kept fraction (``kept / num_tokens``), which on odd
+    grids differs from the nominal ``1/stride**2`` (e.g. 4/9 on a 3x3
+    grid at stride 2).
+    """
+    num_tokens = int(kept_mask.shape[0])
+    pruned_idx = (~kept_mask).nonzero(as_tuple=True)[0]
+    return {
+        "method": "nprune",
+        "grid": [grid_w, grid_h],
+        "num_tokens": num_tokens,
+        "retention": int(kept_idx.numel()) / num_tokens,
+        "stride": stride,
+        "pruned": pruned_idx.tolist(),
+        "uniform": kept_idx.tolist(),
     }

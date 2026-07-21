@@ -83,6 +83,7 @@ from vllm.multimodal.hiprune import (
     build_hiprune_metadata,
     build_hydart_metadata,
     build_hiprune_pp_metadata,
+    build_nprune_metadata,
     dart_keep_count,
     dart_select,
     fold_merged_token_scores,
@@ -92,9 +93,12 @@ from vllm.multimodal.hiprune import (
     get_hiprune_pp_beta,
     get_hiprune_prompt,
     get_hiprune_ratio,
+    get_nprune_stride,
     hiprune_pp_select,
     hiprune_select,
     hydart_select,
+    nprune_keep_count,
+    nprune_select,
     pack_hiprune_config,
     unpack_hiprune_config,
     HIPRUNE_MM_KWARG_KEYS,
@@ -240,7 +244,7 @@ class Qwen2_5_VLImagePixelInputs(TensorSchema):
     # span requests with different methods.
     hiprune_config: Annotated[
         torch.Tensor | None,
-        TensorShape("ni", 6),
+        TensorShape("ni", 7),
     ] = None
 
 
@@ -1526,6 +1530,17 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
                     num_tokens = dart_keep_count(
                         num_tokens, hiprune_ratio, p_img, p_txt
                     )
+                elif method == "nprune":
+                    # Grid-shape-aware count (exact lattice, not a
+                    # ratio-derived budget); must match the model's
+                    # nprune_select over t*grid_h rows.
+                    T, H, W = map(int, grid_thw)
+                    ms = image_processor.merge_size
+                    num_tokens = nprune_keep_count(
+                        T * (H // ms),
+                        W // ms,
+                        get_nprune_stride(hf_processor_mm_kwargs),
+                    )
                 else:
                     num_tokens = hiprune_retained_tokens_count(
                         num_tokens, hiprune_ratio
@@ -1626,13 +1641,29 @@ class Qwen2_5_VLForConditionalGeneration(
         llm_pos_ids_list: list = []
         st = 0
 
-        for (
+        # HiPrune: pruned placeholder runs are shrunk in the prompt, so
+        # each feature occupies mm_position.length tokens, not the full
+        # grid product. Advance by the actual run length and emit exactly
+        # that many position columns — otherwise the cursor overshoots and
+        # the next feature's text_len goes negative on multi-image
+        # requests. The per-column values for pruned runs are provisional;
+        # recompute_mrope_positions replaces them once the pruned
+        # embeddings (with their kept spatial positions) are available.
+        # Unpruned runs have length == grid product, so this is identical
+        # to the upstream behavior.
+        run_lengths = [
+            f.mm_position.length
+            for f in sorted(mm_features, key=lambda f: f.mm_position.offset)
+            if f.modality != "prompt_embeds"
+        ]
+
+        for run_length, (
             offset,
             llm_grid_t,
             llm_grid_h,
             llm_grid_w,
             t_factor,
-        ) in self.iter_mm_grid_thw(mm_features):
+        ) in zip(run_lengths, self.iter_mm_grid_thw(mm_features)):
             text_len = offset - st
             st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
             llm_pos_ids_list.append(
@@ -1642,8 +1673,9 @@ class Qwen2_5_VLForConditionalGeneration(
             grid_indices = np.indices((llm_grid_t, llm_grid_h, llm_grid_w))
             if t_factor != 1.0:
                 grid_indices[0] = (grid_indices[0] * t_factor).astype(np.int64)
-            llm_pos_ids_list.append(grid_indices.reshape(3, -1) + text_len + st_idx)
-            st = offset + llm_grid_t * llm_grid_h * llm_grid_w
+            grid_positions = grid_indices.reshape(3, -1)[:, :run_length]
+            llm_pos_ids_list.append(grid_positions + text_len + st_idx)
+            st = offset + run_length
 
         if st < len(input_tokens):
             st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
@@ -1915,6 +1947,28 @@ class Qwen2_5_VLForConditionalGeneration(
                 else unpack_hiprune_config(None)
             )
             method = cfg.method
+
+            # NPrune: pure uniform-lattice sampling — no attention
+            # capture, no scores, no prompt. Plain visual forward.
+            if method == "nprune":
+                embeds = self.visual(pv, grid_thw=[thw])
+                t, h, w = thw
+                grid_h = h // merge_size
+                grid_w = w // merge_size
+                num_tokens = t * grid_h * grid_w
+                assert embeds.shape[0] == num_tokens
+                # Frames stack vertically in raster order, so the
+                # lattice runs over t*grid_h rows (t is 1 for images).
+                kept_idx, kept_mask = nprune_select(
+                    t * grid_h, grid_w, cfg.stride, device=embeds.device
+                )
+                metadata = build_nprune_metadata(
+                    kept_idx, kept_mask, grid_w, grid_h, cfg.stride
+                )
+                image_embeds_out.append(embeds[kept_mask])
+                self._hiprune_kept_masks[idx] = kept_mask
+                self._hiprune_metadata[idx] = metadata
+                continue
 
             if method == "dart":
                 embeds = self.visual(pv, grid_thw=[thw])
