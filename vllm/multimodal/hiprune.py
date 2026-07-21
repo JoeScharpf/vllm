@@ -62,6 +62,7 @@ Split of responsibilities (mirrors EVS in ``vllm/multimodal/evs.py``):
 
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 import torch
 
@@ -107,32 +108,63 @@ DEFAULT_DART_PIVOT_TEXT = 4
 DEFAULT_DART_LAYER = 2
 
 
-def get_hiprune_method() -> str:
+def get_hiprune_method(merged_kwargs: Mapping[str, object] | None = None) -> str:
     """Selection method for ``--enable-hiprune`` servers.
 
-    ``HIPRUNE_METHOD=hiprune`` (default), ``hydart``, ``hiprune_pp`` or
-    ``dart``. Read from the environment at call time so one env var
-    switches the whole server; the per-request ``token_pruning`` field
-    stays a plain keep-ratio.
+    Per-request via ``mm_processor_kwargs={"hiprune_method": ...}``
+    (attached by the API layer from the ``token_pruning_method`` chat
+    field), falling back to the ``HIPRUNE_METHOD`` env var so
+    env-configured servers and scripts keep working. One of ``hiprune``
+    (default), ``hydart``, ``hiprune_pp`` or ``dart``.
     """
-    method = os.environ.get("HIPRUNE_METHOD", "hiprune").lower()
+    val = merged_kwargs.get("hiprune_method") if merged_kwargs else None
+    if val is None:
+        val = os.environ.get("HIPRUNE_METHOD", "hiprune")
+    method = str(val).lower()
     if method not in ("hiprune", "hydart", "hiprune_pp", "dart"):
         raise ValueError(
-            "HIPRUNE_METHOD must be 'hiprune', 'hydart', 'hiprune_pp' or "
+            "hiprune method must be 'hiprune', 'hydart', 'hiprune_pp' or "
             f"'dart', got {method!r}"
         )
     return method
 
 
-def get_hiprune_pp_beta() -> float:
-    """HiPrune++ text-guidance proportion from env, with paper default."""
-    return float(os.environ.get("HIPRUNE_PP_BETA", DEFAULT_HIPRUNE_PP_BETA))
+def get_hiprune_pp_beta(merged_kwargs: Mapping[str, object] | None = None) -> float:
+    """HiPrune++ text-guidance proportion.
+
+    Per-request ``hiprune_beta`` mm kwarg, else ``HIPRUNE_PP_BETA`` env,
+    else the paper default.
+    """
+    val = merged_kwargs.get("hiprune_beta") if merged_kwargs else None
+    if val is None:
+        val = os.environ.get("HIPRUNE_PP_BETA", DEFAULT_HIPRUNE_PP_BETA)
+    beta = float(val)  # type: ignore[arg-type]
+    if not 0.0 <= beta <= 1.0:
+        raise ValueError(f"hiprune beta must be in [0, 1], got {beta}")
+    return beta
 
 
-def get_dart_pivots() -> tuple[int, int]:
-    """(pivot_image, pivot_text) counts from env, with paper defaults."""
-    p_img = int(os.environ.get("HIPRUNE_DART_PIVOT_IMAGE", DEFAULT_DART_PIVOT_IMAGE))
-    p_txt = int(os.environ.get("HIPRUNE_DART_PIVOT_TEXT", DEFAULT_DART_PIVOT_TEXT))
+def get_dart_pivots(
+    merged_kwargs: Mapping[str, object] | None = None,
+) -> tuple[int, int]:
+    """(pivot_image, pivot_text) counts.
+
+    Per-request ``hiprune_pivot_image`` / ``hiprune_pivot_text`` mm
+    kwargs, else ``HIPRUNE_DART_PIVOT_IMAGE/TEXT`` env, else the paper
+    defaults.
+    """
+    p_img_val = merged_kwargs.get("hiprune_pivot_image") if merged_kwargs else None
+    if p_img_val is None:
+        p_img_val = os.environ.get(
+            "HIPRUNE_DART_PIVOT_IMAGE", DEFAULT_DART_PIVOT_IMAGE
+        )
+    p_txt_val = merged_kwargs.get("hiprune_pivot_text") if merged_kwargs else None
+    if p_txt_val is None:
+        p_txt_val = os.environ.get(
+            "HIPRUNE_DART_PIVOT_TEXT", DEFAULT_DART_PIVOT_TEXT
+        )
+    p_img = int(p_img_val)  # type: ignore[arg-type]
+    p_txt = int(p_txt_val)  # type: ignore[arg-type]
     if p_img < 1 or p_txt < 0:
         raise ValueError(
             "DART pivots must satisfy pivot_image >= 1 and pivot_text >= 0, "
@@ -149,11 +181,111 @@ def get_dart_layer() -> int:
     return layer
 
 
-def get_hydart_lambdas() -> tuple[float, float]:
-    """(lambda_seed, lambda_pick) from env, with paper-Colab defaults."""
-    return (
-        float(os.environ.get("HYDART_LAMBDA_SEED", DEFAULT_HYDART_LAMBDA_SEED)),
-        float(os.environ.get("HYDART_LAMBDA_PICK", DEFAULT_HYDART_LAMBDA_PICK)),
+def get_hydart_lambdas(
+    merged_kwargs: Mapping[str, object] | None = None,
+) -> tuple[float, float]:
+    """(lambda_seed, lambda_pick).
+
+    Per-request ``hiprune_lambda_seed`` / ``hiprune_lambda_pick`` mm
+    kwargs, else ``HYDART_LAMBDA_SEED/PICK`` env, else paper-Colab
+    defaults.
+    """
+    seed_val = merged_kwargs.get("hiprune_lambda_seed") if merged_kwargs else None
+    if seed_val is None:
+        seed_val = os.environ.get("HYDART_LAMBDA_SEED", DEFAULT_HYDART_LAMBDA_SEED)
+    pick_val = merged_kwargs.get("hiprune_lambda_pick") if merged_kwargs else None
+    if pick_val is None:
+        pick_val = os.environ.get("HYDART_LAMBDA_PICK", DEFAULT_HYDART_LAMBDA_PICK)
+    return float(seed_val), float(pick_val)  # type: ignore[arg-type]
+
+
+# All vLLM-side pruning keys that may appear in mm_processor_kwargs.
+# Model processors strip these before calling the HF processor.
+HIPRUNE_MM_KWARG_KEYS = (
+    "hiprune_ratio",
+    "hiprune_prompt",
+    "hiprune_method",
+    "hiprune_lambda_seed",
+    "hiprune_lambda_pick",
+    "hiprune_beta",
+    "hiprune_pivot_image",
+    "hiprune_pivot_text",
+)
+
+# Method <-> id mapping for the packed per-image config tensor (mm
+# fields must be tensors, so the method travels as a float id).
+HIPRUNE_METHOD_IDS: dict[str, int] = {
+    "hiprune": 0,
+    "hydart": 1,
+    "hiprune_pp": 2,
+    "dart": 3,
+}
+_HIPRUNE_ID_METHODS = {v: k for k, v in HIPRUNE_METHOD_IDS.items()}
+
+# Row layout of the packed config: (method_id, lambda_seed, lambda_pick,
+# beta, pivot_image, pivot_text).
+HIPRUNE_CONFIG_WIDTH = 6
+
+
+@dataclass(frozen=True)
+class HipruneConfig:
+    """Per-image pruning configuration, decoded from the packed row."""
+
+    method: str
+    lambda_seed: float
+    lambda_pick: float
+    beta: float
+    pivot_image: int
+    pivot_text: int
+
+
+def pack_hiprune_config(
+    merged_kwargs: Mapping[str, object] | None = None,
+) -> torch.Tensor:
+    """Encode the request's method + knobs as one float32 row.
+
+    Attached per image by the multimodal processor (mirroring how
+    ``hiprune_ratio`` travels) so the model forward can dispatch the
+    selection method per image — a batch may span requests with
+    different methods.
+    """
+    method = get_hiprune_method(merged_kwargs)
+    lambda_seed, lambda_pick = get_hydart_lambdas(merged_kwargs)
+    beta = get_hiprune_pp_beta(merged_kwargs)
+    pivot_image, pivot_text = get_dart_pivots(merged_kwargs)
+    return torch.tensor(
+        [
+            float(HIPRUNE_METHOD_IDS[method]),
+            lambda_seed,
+            lambda_pick,
+            beta,
+            float(pivot_image),
+            float(pivot_text),
+        ],
+        dtype=torch.float32,
+    )
+
+
+def unpack_hiprune_config(row: torch.Tensor | None) -> HipruneConfig:
+    """Decode a packed config row; ``None`` falls back to env/defaults."""
+    if row is None:
+        return unpack_hiprune_config(pack_hiprune_config())
+    vals = row.float().tolist()
+    if len(vals) != HIPRUNE_CONFIG_WIDTH:
+        raise ValueError(
+            f"hiprune_config row must have {HIPRUNE_CONFIG_WIDTH} entries, "
+            f"got {len(vals)}"
+        )
+    method = _HIPRUNE_ID_METHODS.get(int(round(vals[0])))
+    if method is None:
+        raise ValueError(f"unknown hiprune method id {vals[0]!r}")
+    return HipruneConfig(
+        method=method,
+        lambda_seed=vals[1],
+        lambda_pick=vals[2],
+        beta=vals[3],
+        pivot_image=int(round(vals[4])),
+        pivot_text=int(round(vals[5])),
     )
 
 
