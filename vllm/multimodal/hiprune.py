@@ -33,6 +33,20 @@ arXiv 2502.11494) instead of deep-layer registers. This removes the
 second dense attention-score capture — the dominant selection cost on
 large images — since only the object layer is needed.
 
+**HiPrune++** (:func:`hiprune_pp_select`, ``HIPRUNE_METHOD=hiprune_pp``)
+is the prompt-aware variant from the same paper (Appendix A, Algorithm
+1): after the standard anchor/buffer/register selection it additionally
+keeps the ``round(beta * budget)`` visual tokens most cosine-similar to
+the prompt's mean text embedding, additive on top of the base budget.
+The paper uses a paired CLIP text encoder where one exists; per the
+paper's own fallback for encoders without one, this implementation
+compares the LM-space visual embeddings against the average of the
+language model's text embeddings of the prompt — uniformly for all
+models. Because the prompt now influences selection, the API layer
+attaches the user prompt as an mm kwarg (``hiprune_prompt``), which also
+makes the multimodal cache hash prompt-dependent (correct: the same
+image pruned under a different prompt keeps different tokens).
+
 Split of responsibilities (mirrors EVS in ``vllm/multimodal/evs.py``):
 
 - The multimodal processor calls :func:`compute_retained_tokens_count` to
@@ -79,20 +93,31 @@ DEFAULT_HYDART_LAMBDA_PICK = 0.5
 HYDART_BLOCK_THRESHOLD = 2048
 HYDART_BLOCK_SIZE = 8
 
+# HiPrune++ text-guidance proportion. Paper: "We set beta = 0.1 for all
+# the models when evaluating Hiprune++."
+DEFAULT_HIPRUNE_PP_BETA = 0.1
+
 
 def get_hiprune_method() -> str:
     """Selection method for ``--enable-hiprune`` servers.
 
-    ``HIPRUNE_METHOD=hiprune`` (default) or ``hydart``. Read from the
-    environment at call time so one env var switches the whole server;
-    the per-request ``token_pruning`` field stays a plain keep-ratio.
+    ``HIPRUNE_METHOD=hiprune`` (default), ``hydart`` or ``hiprune_pp``.
+    Read from the environment at call time so one env var switches the
+    whole server; the per-request ``token_pruning`` field stays a plain
+    keep-ratio.
     """
     method = os.environ.get("HIPRUNE_METHOD", "hiprune").lower()
-    if method not in ("hiprune", "hydart"):
+    if method not in ("hiprune", "hydart", "hiprune_pp"):
         raise ValueError(
-            f"HIPRUNE_METHOD must be 'hiprune' or 'hydart', got {method!r}"
+            "HIPRUNE_METHOD must be 'hiprune', 'hydart' or 'hiprune_pp', "
+            f"got {method!r}"
         )
     return method
+
+
+def get_hiprune_pp_beta() -> float:
+    """HiPrune++ text-guidance proportion from env, with paper default."""
+    return float(os.environ.get("HIPRUNE_PP_BETA", DEFAULT_HIPRUNE_PP_BETA))
 
 
 def get_hydart_lambdas() -> tuple[float, float]:
@@ -129,6 +154,23 @@ def get_hiprune_ratio(merged_kwargs: Mapping[str, object]) -> float | None:
     return float(torch.tensor(ratio, dtype=torch.float32).item())
 
 
+def get_hiprune_prompt(merged_kwargs: Mapping[str, object]) -> str | None:
+    """Extract the HiPrune++ prompt text from mm kwargs.
+
+    Attached by the API layer alongside ``hiprune_ratio`` when the server
+    runs with ``HIPRUNE_METHOD=hiprune_pp`` (the text parts of the latest
+    user message). May be ``None`` for image-only messages; the keep
+    *count* never depends on the prompt (only on ratio and beta), so
+    callers fall back to a zero text embedding — all similarities zero,
+    the text slots are filled arbitrarily but the count invariant holds.
+    """
+    val = merged_kwargs.get("hiprune_prompt")
+    if val is None:
+        return None
+    text = str(val)
+    return text if text.strip() else None
+
+
 def compute_retained_tokens_count(num_tokens: int, pruning_ratio: float) -> int:
     """Number of soft tokens kept for an image at the given retention.
 
@@ -141,6 +183,39 @@ def compute_retained_tokens_count(num_tokens: int, pruning_ratio: float) -> int:
     the two can never disagree.
     """
     return max(1, min(num_tokens, round(num_tokens * pruning_ratio)))
+
+
+def compute_hiprune_pp_budget(
+    num_tokens: int,
+    pruning_ratio: float,
+    beta: float | None = None,
+) -> tuple[int, int]:
+    """HiPrune++ keep budget: ``(base_budget, text_token_count)``.
+
+    The base budget is the plain HiPrune budget
+    (:func:`compute_retained_tokens_count`); the text-guided tokens are
+    *additive* on top of it, exactly as in the paper's Algorithm 1 where
+    ``retained_idx = cat([a_idx, b_idx, r_idx, t_idx])`` after the base
+    categories already fill ``N``. For the count, the paper's prose and
+    pseudo-code disagree: the prose says "retain [beta * N] visual
+    tokens ... where beta is the proportion of visual tokens selected by
+    text-relevance", while the pseudo-code line reads
+    ``t_sum = round(N * beta / 5)``. We follow the prose — the ``/5``
+    mirrors the anchor line, where it exists because each anchor pulls
+    in 4 buffer neighbors, a justification that does not apply to text
+    tokens; and at the paper's 64-token LLaVA budget the ``/5`` form
+    would add a single token, which cannot produce the reported gains.
+
+    ``t_sum`` is clamped so the total never exceeds ``num_tokens``.
+    Called by both the multimodal processor (placeholder sizing:
+    ``base + t_sum``) and :func:`hiprune_pp_select`, so the two can
+    never disagree.
+    """
+    if beta is None:
+        beta = get_hiprune_pp_beta()
+    base = compute_retained_tokens_count(num_tokens, pruning_ratio)
+    t_sum = round(base * beta)
+    return base, max(0, min(t_sum, num_tokens - base))
 
 
 def compute_soft_token_grid(
@@ -300,6 +375,96 @@ def hiprune_select(
     kept_mask = selected_mask.clone()
     kept_mask[register_idx] = True
     return anchor_idx, buffer_idx, register_idx, kept_mask
+
+
+def hiprune_pp_select(
+    shallow_scores: torch.Tensor,
+    deep_scores: torch.Tensor,
+    embeddings: torch.Tensor,
+    text_embedding: torch.Tensor,
+    num_tokens: int,
+    grid_w: int,
+    pruning_ratio: float,
+    alpha: float = DEFAULT_ALPHA,
+    beta: float | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """HiPrune++: HiPrune plus text-guided prompt tokens (Algorithm 1).
+
+    Runs the exact HiPrune anchor/buffer/register selection
+    (:func:`hiprune_select`), then additionally keeps the
+    ``text_token_count`` (see :func:`compute_hiprune_pp_budget`) tokens
+    whose LM-space embeddings are most cosine-similar to the prompt's
+    mean text embedding, excluding tokens the base method already kept.
+    Keeps exactly ``base_budget + text_token_count`` tokens.
+
+    One deliberate deviation from the pseudo-code: Algorithm 1 masks
+    already-chosen tokens by subtracting 1 from their similarity, which
+    guarantees exclusion for positive attention scores but *not* for
+    cosine similarity in ``[-1, 1]`` (a masked token at 0.9 would still
+    beat an unmasked one at -0.2). We mask with ``-inf`` instead, which
+    is the unambiguous intent.
+
+    Args:
+        shallow_scores: ``(num_tokens,)`` soft-token scores from the
+            object (middle) encoder layer.
+        deep_scores: ``(num_tokens,)`` soft-token scores from the last
+            encoder layer.
+        embeddings: ``(num_tokens, hidden)`` visual embeddings in the
+            same (raster) token order as ``shallow_scores`` — the
+            tensors the language model would consume. Any float dtype;
+            similarity math runs in float32.
+        text_embedding: ``(hidden,)`` mean of the prompt's text-token
+            embeddings from the language model's embedding table (need
+            not be pre-normalized).
+        num_tokens: total soft tokens for the image.
+        grid_w: soft-token grid width (for spatial buffer neighbors).
+        pruning_ratio: retention ratio in ``(0, 1]``.
+        alpha: fraction of the base budget allotted to anchors.
+        beta: text-guidance proportion; ``None`` reads ``HIPRUNE_PP_BETA``
+            from the environment (paper default 0.1).
+
+    Returns:
+        ``(anchor_idx, buffer_idx, register_idx, prompt_idx, kept_mask,
+        text_similarity)`` where ``text_similarity`` is the
+        ``(num_tokens,)`` float32 cosine similarity of every token to
+        the mean text embedding (for metadata/tooltips).
+    """
+    anchor_idx, buffer_idx, register_idx, kept_mask = hiprune_select(
+        shallow_scores, deep_scores, num_tokens, grid_w, pruning_ratio, alpha=alpha
+    )
+
+    _, t_sum = compute_hiprune_pp_budget(num_tokens, pruning_ratio, beta)
+
+    emb = torch.nn.functional.normalize(embeddings.float(), dim=-1)
+    text = torch.nn.functional.normalize(text_embedding.float(), dim=-1)
+    text_similarity = emb @ text
+
+    if t_sum > 0:
+        masked = text_similarity.clone()
+        masked[kept_mask] = float("-inf")
+        prompt_idx = torch.topk(masked, k=t_sum).indices
+        kept_mask = kept_mask.clone()
+        kept_mask[prompt_idx] = True
+    else:
+        prompt_idx = torch.empty(
+            0, dtype=anchor_idx.dtype, device=kept_mask.device
+        )
+
+    return (
+        anchor_idx,
+        buffer_idx,
+        register_idx,
+        prompt_idx,
+        kept_mask,
+        text_similarity,
+    )
 
 
 def hydart_select(
@@ -497,6 +662,79 @@ def build_hydart_metadata(
         "scores": {
             "object_layer": shallow_scores.float().tolist(),
             "similarity": sim_stats.float().tolist(),
+        },
+    }
+
+
+def build_hiprune_pp_metadata(
+    anchor_idx: torch.Tensor,
+    buffer_idx: torch.Tensor,
+    register_idx: torch.Tensor,
+    prompt_idx: torch.Tensor,
+    kept_mask: torch.Tensor,
+    shallow_scores: torch.Tensor,
+    deep_scores: torch.Tensor,
+    text_similarity: torch.Tensor,
+    grid_w: int,
+    grid_h: int,
+    retention: float,
+    object_layer: int,
+    alpha: float = DEFAULT_ALPHA,
+    beta: float | None = None,
+) -> dict[str, object]:
+    """JSON-safe per-image HiPrune++ metadata for API reporting.
+
+    Extends :func:`build_hiprune_metadata` with the ``prompt`` token
+    category (text-guided picks) and per-token cosine similarity to the
+    prompt's mean text embedding, for hover tooltips.
+    """
+    if beta is None:
+        beta = get_hiprune_pp_beta()
+
+    def _mean(scores: torch.Tensor, idx: torch.Tensor) -> float | None:
+        return float(scores[idx].mean()) if idx.numel() else None
+
+    pruned_idx = (~kept_mask).nonzero(as_tuple=True)[0]
+    kept_idx = kept_mask.nonzero(as_tuple=True)[0]
+    categories = {
+        "anchor": anchor_idx,
+        "buffer": buffer_idx,
+        "register": register_idx,
+        "prompt": prompt_idx,
+        "kept": kept_idx,
+        "pruned": pruned_idx,
+    }
+    return {
+        "method": "hiprune_pp",
+        "grid": [grid_w, grid_h],
+        "num_tokens": int(kept_mask.shape[0]),
+        "retention": retention,
+        "object_layer": object_layer,
+        "alpha": alpha,
+        "beta": beta,
+        "pruned": pruned_idx.tolist(),
+        "anchors": anchor_idx.tolist(),
+        "buffers": buffer_idx.tolist(),
+        "registers": register_idx.tolist(),
+        "prompt_tokens": prompt_idx.tolist(),
+        "mean_attention": {
+            "object_layer": {
+                name: _mean(shallow_scores, idx) for name, idx in categories.items()
+            },
+            "deep_layer": {
+                name: _mean(deep_scores, idx) for name, idx in categories.items()
+            },
+        },
+        "text_similarity_summary": {
+            "prompt": _mean(text_similarity, prompt_idx),
+            "kept": _mean(text_similarity, kept_idx),
+            "pruned": _mean(text_similarity, pruned_idx),
+        },
+        # Per-token arrays for hover tooltips (index = soft-token index).
+        "scores": {
+            "object_layer": shallow_scores.float().tolist(),
+            "deep_layer": deep_scores.float().tolist(),
+            "text_similarity": text_similarity.float().tolist(),
         },
     }
 

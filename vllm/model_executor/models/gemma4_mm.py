@@ -48,12 +48,16 @@ from vllm.multimodal.hiprune import (
     GEMMA4_OBJECT_LAYER,
     aggregate_patch_attention,
     build_hiprune_metadata,
+    build_hiprune_pp_metadata,
     build_hydart_metadata,
+    compute_hiprune_pp_budget,
     compute_retained_tokens_count,
     compute_soft_token_grid,
     get_hiprune_method,
+    get_hiprune_prompt as _get_hiprune_prompt,
     get_hiprune_ratio as _get_hiprune_ratio,
     get_hydart_lambdas,
+    hiprune_pp_select,
     hiprune_select,
     hydart_select,
 )
@@ -120,6 +124,20 @@ def _get_max_soft_tokens(
     return None, False
 
 
+def _hiprune_keep_count(num_soft: int, hiprune_ratio: float) -> int:
+    """Soft tokens kept for an image under the active HIPRUNE_METHOD.
+
+    HiPrune and HyDART keep the plain retained-token budget; HiPrune++
+    adds the text-guided tokens on top (additive, per the paper). Shared
+    by every placeholder-sizing site in this file so the prompt side can
+    never disagree with the model's selection.
+    """
+    if get_hiprune_method() == "hiprune_pp":
+        base, t_sum = compute_hiprune_pp_budget(num_soft, hiprune_ratio)
+        return base + t_sum
+    return compute_retained_tokens_count(num_soft, hiprune_ratio)
+
+
 def _shrink_image_token_runs(
     input_ids: torch.Tensor,
     image_token_id: int,
@@ -151,7 +169,7 @@ def _shrink_image_token_runs(
             run_start = pos
         elif not inside and run_start is not None:
             run_len = pos - run_start
-            kept = compute_retained_tokens_count(run_len, hiprune_ratio)
+            kept = _hiprune_keep_count(run_len, hiprune_ratio)
             keep[run_start + kept : pos] = False
             run_start = None
 
@@ -193,6 +211,15 @@ class Gemma4ImagePixelInputs(TensorSchema):
     hiprune_ratio: Annotated[
         torch.Tensor | list[torch.Tensor] | None,
         TensorShape("bn"),
+    ] = None
+    # HiPrune++ prompt token ids, one identical row per image (the mm
+    # field machinery is per-item), emitted by the processor only under
+    # HIPRUNE_METHOD=hiprune_pp. "pl" (prompt length) is dynamic because
+    # a batch can span requests with different prompts (rows then arrive
+    # as a list of unequal-length tensors).
+    hiprune_prompt_ids: Annotated[
+        torch.Tensor | list[torch.Tensor] | None,
+        TensorShape("bn", "pl", dynamic_dims={"pl"}),
     ] = None
 
 
@@ -263,9 +290,10 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
         return params
 
     def get_hf_processor(self, **kwargs: object) -> Gemma4Processor:
-        # hiprune_ratio is a vLLM-side kwarg; the HF processor constructor
-        # must never see it.
+        # hiprune_ratio / hiprune_prompt are vLLM-side kwargs; the HF
+        # processor constructor must never see them.
         kwargs.pop("hiprune_ratio", None)
+        kwargs.pop("hiprune_prompt", None)
         return self.ctx.get_hf_processor(
             Gemma4Processor,
             **kwargs,
@@ -402,7 +430,7 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
             max_soft_tokens=max_soft_tokens,
         )
         if hiprune_ratio is not None:
-            num_soft = compute_retained_tokens_count(num_soft, hiprune_ratio)
+            num_soft = _hiprune_keep_count(num_soft, hiprune_ratio)
         config = self.get_hf_config()
         token_ids = (
             [config.boi_token_id]
@@ -686,8 +714,9 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
                 # Process frames as images with max_soft_tokens=70
                 video_mm_kwargs = dict(mm_kwargs)
                 # HiPrune only applies to images, and the HF processor
-                # does not accept the kwarg.
+                # does not accept the kwargs.
                 video_mm_kwargs.pop("hiprune_ratio", None)
+                video_mm_kwargs.pop("hiprune_prompt", None)
                 video_mm_kwargs["max_soft_tokens"] = _VIDEO_MAX_SOFT_TOKENS
 
                 dummy_prompt = ("\t" + processor.image_token) * len(frames)
@@ -790,9 +819,10 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
         # HF side (Gemma4ProcessorKwargs.images_kwargs) so that
         # _merge_kwargs routes max_soft_tokens into images_kwargs.
         patched_mm_kwargs = dict(mm_kwargs)
-        # hiprune_ratio is consumed by vLLM (placeholder sizing + model
-        # selection); the HF processor does not know it.
+        # hiprune_ratio / hiprune_prompt are consumed by vLLM (placeholder
+        # sizing + model selection); the HF processor does not know them.
         patched_mm_kwargs.pop("hiprune_ratio", None)
+        patched_mm_kwargs.pop("hiprune_prompt", None)
         if val is not None and is_top_level_max_soft_tokens:
             patched_mm_kwargs["max_soft_tokens"] = val
 
@@ -821,6 +851,21 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
             processed_outputs["hiprune_ratio"] = torch.full(
                 (num_images,), hiprune_ratio, dtype=torch.float32
             )
+            # HiPrune++: ship the prompt token ids to the model so it can
+            # embed them (LM embedding table) for text-guided selection.
+            # One identical row per image — the mm field machinery is
+            # per-item.
+            if get_hiprune_method() == "hiprune_pp":
+                hiprune_prompt = _get_hiprune_prompt(merged_kwargs)
+                tokenizer = self.info.get_tokenizer()
+                ids = (
+                    tokenizer.encode(hiprune_prompt, add_special_tokens=False)
+                    if hiprune_prompt
+                    else []
+                )
+                processed_outputs["hiprune_prompt_ids"] = (
+                    torch.tensor([ids], dtype=torch.long).repeat(num_images, 1)
+                )
 
             processor = self.info.get_hf_processor()
             input_ids = processed_outputs["input_ids"]
@@ -864,6 +909,7 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
             pixel_values=MultiModalFieldConfig.batched("image"),
             pixel_position_ids=MultiModalFieldConfig.batched("image"),
             hiprune_ratio=MultiModalFieldConfig.batched("image"),
+            hiprune_prompt_ids=MultiModalFieldConfig.batched("image"),
             input_features_padded=MultiModalFieldConfig.batched("audio"),
             input_features_mask=MultiModalFieldConfig.batched("audio"),
         )
@@ -1254,6 +1300,7 @@ class Gemma4ForConditionalGeneration(
             pixel_values=pixel_values,
             pixel_position_ids=pixel_position_ids,
             hiprune_ratio=kwargs.pop("hiprune_ratio", None),
+            hiprune_prompt_ids=kwargs.pop("hiprune_prompt_ids", None),
         )
 
     def _parse_and_validate_audio_input(
@@ -1441,6 +1488,15 @@ class Gemma4ForConditionalGeneration(
             for idx in range(total_images):
                 ratio = float(hp_field[idx])
                 ratios[idx] = ratio if ratio < 1.0 else None
+        # HiPrune++ prompt ids, kept per image: a batch can span
+        # multiple requests with different prompts.
+        prompt_ids: list[torch.Tensor | None] = [None] * total_images
+        pid_field = image_input.get("hiprune_prompt_ids")
+        if pid_field is not None:
+            for idx in range(total_images):
+                row = pid_field[idx]
+                if row.numel():
+                    prompt_ids[idx] = row
         # HyDART needs only the object-layer scores (its diverse fill uses
         # embedding similarity, not deep attention). Skipping the last
         # layer halves the eager-attention capture cost, which on Gemma
@@ -1620,6 +1676,48 @@ class Gemma4ForConditionalGeneration(
                         object_layer=GEMMA4_OBJECT_LAYER,
                         lambda_seed=lambda_seed,
                         lambda_pick=lambda_pick,
+                    )
+                elif method == "hiprune_pp":
+                    assert deep is not None
+                    # HiPrune++'s text similarity runs over the embeddings
+                    # the LM consumes, so project this image's soft tokens
+                    # now (like HyDART; the kept ones are projected again
+                    # in the batched call below).
+                    lm_embeds = self.embed_vision(
+                        inputs_embeds=valid_states.to(self.model_dtype).unsqueeze(0)
+                    ).squeeze(0)
+                    pid = prompt_ids[orig_idx]
+                    if pid is not None:
+                        embed_tokens = self.language_model.model.embed_tokens
+                        text_emb = embed_tokens(pid.long()).float().mean(dim=0)
+                    else:
+                        text_emb = lm_embeds.new_zeros(
+                            lm_embeds.shape[-1], dtype=torch.float32
+                        )
+                    (
+                        anchor_idx,
+                        buffer_idx,
+                        register_idx,
+                        prompt_idx,
+                        kept_mask,
+                        text_similarity,
+                    ) = hiprune_pp_select(
+                        shallow, deep, lm_embeds, text_emb, num_soft, grid_w, ratio
+                    )
+                    valid_states = valid_states[kept_mask]
+                    hiprune_metadata[orig_idx] = build_hiprune_pp_metadata(
+                        anchor_idx,
+                        buffer_idx,
+                        register_idx,
+                        prompt_idx,
+                        kept_mask,
+                        shallow,
+                        deep,
+                        text_similarity,
+                        grid_w,
+                        grid_h,
+                        ratio,
+                        object_layer=GEMMA4_OBJECT_LAYER,
                     )
                 else:
                     assert deep is not None

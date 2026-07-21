@@ -10,12 +10,16 @@ from vllm.multimodal.hiprune import (
     QWEN2_5_VL_OBJECT_LAYER,
     aggregate_patch_attention,
     build_hiprune_metadata,
+    build_hiprune_pp_metadata,
     build_hydart_metadata,
+    compute_hiprune_pp_budget,
     compute_retained_tokens_count,
     compute_soft_token_grid,
     fold_merged_token_scores,
     get_hiprune_method,
+    get_hiprune_prompt,
     get_hiprune_ratio,
+    hiprune_pp_select,
     hiprune_select,
     hydart_select,
 )
@@ -808,6 +812,214 @@ def test_get_hiprune_method_env(monkeypatch):
     assert get_hiprune_method() == "hydart"
     monkeypatch.setenv("HIPRUNE_METHOD", "HyDART")
     assert get_hiprune_method() == "hydart"
+    monkeypatch.setenv("HIPRUNE_METHOD", "hiprune_pp")
+    assert get_hiprune_method() == "hiprune_pp"
     monkeypatch.setenv("HIPRUNE_METHOD", "bogus")
     with pytest.raises(ValueError):
         get_hiprune_method()
+
+
+# --------------------------------------------------------------------------
+# HiPrune++ (prompt-aware selection, paper Algorithm 1)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_tokens", [1, 12, 255, 260, 576, 1280])
+@pytest.mark.parametrize("ratio", [0.05, 0.11, 0.14, 0.223, 0.5, 0.95])
+@pytest.mark.parametrize("beta", [0.0, 0.1, 0.3, 1.0])
+def test_hiprune_pp_budget_bounds(num_tokens: int, ratio: float, beta: float):
+    base, t_sum = compute_hiprune_pp_budget(num_tokens, ratio, beta)
+    assert base == compute_retained_tokens_count(num_tokens, ratio)
+    assert t_sum >= 0
+    # The paper's prose: retain [beta * N] text-guided visual tokens,
+    # clamped so the total never exceeds the token count.
+    assert t_sum == min(round(base * beta), num_tokens - base)
+    assert base + t_sum <= num_tokens
+
+
+def _pp_case(seed: int, n_tokens: int = 260, hidden: int = 64):
+    torch.manual_seed(seed)
+    shallow = torch.rand(n_tokens).softmax(dim=0)
+    deep = torch.rand(n_tokens).softmax(dim=0)
+    embeddings = torch.randn(n_tokens, hidden)
+    text = torch.randn(hidden)
+    return shallow, deep, embeddings, text
+
+
+@pytest.mark.parametrize("seed", range(10))
+@pytest.mark.parametrize("ratio", [0.11, 0.14, 0.223, 0.5])
+@pytest.mark.parametrize("beta", [0.1, 0.3])
+def test_hiprune_pp_invariants(seed: int, ratio: float, beta: float):
+    n_tokens, grid_w = 260, 20
+    shallow, deep, embeddings, text = _pp_case(seed, n_tokens)
+
+    anchor, buffer, register, prompt, kept, sim = hiprune_pp_select(
+        shallow, deep, embeddings, text, n_tokens, grid_w, ratio, beta=beta
+    )
+
+    # Exact budget: base + text-guided extra, matching the placeholder
+    # count the processors emit.
+    base, t_sum = compute_hiprune_pp_budget(n_tokens, ratio, beta)
+    assert kept.sum().item() == base + t_sum
+    assert prompt.numel() == t_sum
+
+    # The base categories are exactly plain HiPrune's selection.
+    ref = hiprune_select(shallow, deep, n_tokens, grid_w, ratio)
+    assert torch.equal(anchor, ref[0])
+    assert torch.equal(buffer, ref[1])
+    assert torch.equal(register, ref[2])
+
+    # Categories are disjoint and jointly equal the kept set.
+    all_idx = torch.cat([anchor, buffer, register, prompt])
+    assert all_idx.unique().numel() == all_idx.numel()
+    mask_from_cats = torch.zeros(n_tokens, dtype=torch.bool)
+    mask_from_cats[all_idx] = True
+    assert torch.equal(mask_from_cats, kept)
+
+    # Prompt tokens are exactly the top-t_sum by text similarity among
+    # tokens the base method did not keep (Algorithm 1 lines 26-30).
+    emb_n = torch.nn.functional.normalize(embeddings.float(), dim=-1)
+    text_n = torch.nn.functional.normalize(text.float(), dim=-1)
+    expected_sim = emb_n @ text_n
+    assert torch.allclose(sim, expected_sim, atol=1e-6)
+    masked = expected_sim.clone()
+    masked[ref[3]] = float("-inf")
+    expected_prompt = torch.topk(masked, k=t_sum).indices
+    assert torch.equal(torch.sort(prompt).values, torch.sort(expected_prompt).values)
+
+
+def test_hiprune_pp_deterministic():
+    shallow, deep, embeddings, text = _pp_case(7)
+    first = hiprune_pp_select(
+        shallow, deep, embeddings, text, 260, 20, 0.14, beta=0.1
+    )
+    second = hiprune_pp_select(
+        shallow, deep, embeddings, text, 260, 20, 0.14, beta=0.1
+    )
+    for a, b in zip(first, second):
+        assert torch.equal(a, b)
+
+
+def test_hiprune_pp_zero_beta_matches_hiprune():
+    shallow, deep, embeddings, text = _pp_case(11)
+    anchor, buffer, register, prompt, kept, _ = hiprune_pp_select(
+        shallow, deep, embeddings, text, 260, 20, 0.14, beta=0.0
+    )
+    ref = hiprune_select(shallow, deep, 260, 20, 0.14)
+    assert prompt.numel() == 0
+    assert torch.equal(kept, ref[3])
+
+
+def test_hiprune_pp_full_retention_keeps_everything():
+    shallow, deep, embeddings, text = _pp_case(3, n_tokens=255)
+    _, _, _, prompt, kept, _ = hiprune_pp_select(
+        shallow, deep, embeddings, text, 255, 15, 1.0, beta=0.1
+    )
+    # Base budget already covers every token; no room for text picks.
+    assert kept.all()
+    assert prompt.numel() == 0
+
+
+def test_hiprune_pp_zero_text_embedding():
+    """Image-only messages: zero text vector still keeps the exact count."""
+    shallow, deep, embeddings, _ = _pp_case(5)
+    text = torch.zeros(embeddings.shape[-1])
+    _, _, _, prompt, kept, sim = hiprune_pp_select(
+        shallow, deep, embeddings, text, 260, 20, 0.14, beta=0.1
+    )
+    base, t_sum = compute_hiprune_pp_budget(260, 0.14, 0.1)
+    assert kept.sum().item() == base + t_sum
+    assert prompt.numel() == t_sum
+    assert (sim == 0).all()
+
+
+def test_hiprune_pp_prompt_tokens_track_text():
+    """Tokens aligned with the text embedding must win the prompt slots."""
+    torch.manual_seed(9)
+    n_tokens, grid_w, hidden = 260, 20, 64
+    shallow = torch.rand(n_tokens).softmax(dim=0)
+    deep = torch.rand(n_tokens).softmax(dim=0)
+    text = torch.randn(hidden)
+    # Orthogonalize all embeddings against text, then plant strong
+    # alignment on a few tokens the base method does not keep.
+    embeddings = torch.randn(n_tokens, hidden)
+    text_n = torch.nn.functional.normalize(text, dim=-1)
+    embeddings -= (embeddings @ text_n).unsqueeze(-1) * text_n
+    ref_kept = hiprune_select(shallow, deep, n_tokens, grid_w, 0.14)[3]
+    unkept = (~ref_kept).nonzero(as_tuple=True)[0]
+    base, t_sum = compute_hiprune_pp_budget(n_tokens, 0.14, 0.3)
+    planted = unkept[:t_sum]
+    embeddings[planted] += 10.0 * text_n
+
+    _, _, _, prompt, _, _ = hiprune_pp_select(
+        shallow, deep, embeddings, text, n_tokens, grid_w, 0.14, beta=0.3
+    )
+    assert torch.equal(torch.sort(prompt).values, torch.sort(planted).values)
+
+
+def test_hiprune_pp_metadata_contents():
+    import json
+
+    shallow, deep, embeddings, text = _pp_case(13)
+    n_tokens, grid_w, grid_h, ratio, beta = 260, 20, 13, 0.14, 0.1
+    anchor, buffer, register, prompt, kept, sim = hiprune_pp_select(
+        shallow, deep, embeddings, text, n_tokens, grid_w, ratio, beta=beta
+    )
+    md = build_hiprune_pp_metadata(
+        anchor,
+        buffer,
+        register,
+        prompt,
+        kept,
+        shallow,
+        deep,
+        sim,
+        grid_w,
+        grid_h,
+        ratio,
+        object_layer=17,
+        beta=beta,
+    )
+    json.dumps(md)  # must be JSON-safe
+
+    assert md["method"] == "hiprune_pp"
+    assert md["grid"] == [grid_w, grid_h]
+    assert md["num_tokens"] == n_tokens
+    assert md["beta"] == beta
+    assert md["object_layer"] == 17
+    assert sorted(md["prompt_tokens"]) == sorted(prompt.tolist())
+    base, t_sum = compute_hiprune_pp_budget(n_tokens, ratio, beta)
+    assert len(md["pruned"]) == n_tokens - (base + t_sum)
+    # Categories partition kept + pruned = all tokens.
+    all_reported = (
+        md["anchors"]
+        + md["buffers"]
+        + md["registers"]
+        + md["prompt_tokens"]
+        + md["pruned"]
+    )
+    assert sorted(all_reported) == list(range(n_tokens))
+    # Per-token arrays for tooltips.
+    assert len(md["scores"]["object_layer"]) == n_tokens
+    assert len(md["scores"]["deep_layer"]) == n_tokens
+    assert len(md["scores"]["text_similarity"]) == n_tokens
+    # Prompt tokens have the highest mean text similarity of the
+    # reported categories (they were chosen by it).
+    ts = md["text_similarity_summary"]
+    assert ts["prompt"] >= ts["pruned"]
+
+
+def test_get_hiprune_prompt_passthrough():
+    assert get_hiprune_prompt({}) is None
+    assert get_hiprune_prompt({"hiprune_prompt": None}) is None
+    assert get_hiprune_prompt({"hiprune_prompt": "   "}) is None
+    assert get_hiprune_prompt({"hiprune_prompt": "what color?"}) == "what color?"
+
+
+def test_get_hiprune_pp_beta_env(monkeypatch):
+    from vllm.multimodal.hiprune import get_hiprune_pp_beta
+
+    monkeypatch.delenv("HIPRUNE_PP_BETA", raising=False)
+    assert get_hiprune_pp_beta() == pytest.approx(0.1)
+    monkeypatch.setenv("HIPRUNE_PP_BETA", "0.25")
+    assert get_hiprune_pp_beta() == pytest.approx(0.25)

@@ -982,13 +982,49 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def merge_token_pruning_into_mm_kwargs(self):
         """Map the top-level token_pruning field onto the HiPrune
         mm-processor kwarg so it reaches the multimodal processor (and
-        thus the mm/prefix-cache hash) through the standard path."""
+        thus the mm/prefix-cache hash) through the standard path.
+
+        Under ``HIPRUNE_METHOD=hiprune_pp`` the selection is prompt-aware,
+        so the text of the latest user message is attached as
+        ``hiprune_prompt`` too. Attaching it via mm kwargs deliberately
+        makes the mm-cache hash prompt-dependent — the same image pruned
+        under a different prompt keeps different tokens. Other methods
+        never attach it, so their cache behavior is unchanged.
+        """
         if self.token_pruning is not None:
             self.mm_processor_kwargs = {
                 **(self.mm_processor_kwargs or {}),
                 "hiprune_ratio": self.token_pruning,
             }
+            from vllm.multimodal.hiprune import get_hiprune_method
+
+            if get_hiprune_method() == "hiprune_pp":
+                prompt = self._extract_latest_user_text()
+                if prompt:
+                    self.mm_processor_kwargs["hiprune_prompt"] = prompt
         return self
+
+    def _extract_latest_user_text(self) -> str:
+        """Text parts of the latest user message (HiPrune++ guidance).
+
+        Matches the paper's single-instruction setting: only the current
+        question guides token selection, not the conversation history.
+        """
+        for message in reversed(self.messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = [
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ]
+                return "\n".join(p for p in parts if p)
+            return ""
+        return ""
 
     @model_validator(mode="before")
     @classmethod
