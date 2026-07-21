@@ -984,12 +984,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         mm-processor kwarg so it reaches the multimodal processor (and
         thus the mm/prefix-cache hash) through the standard path.
 
-        Under ``HIPRUNE_METHOD=hiprune_pp`` the selection is prompt-aware,
-        so the text of the latest user message is attached as
-        ``hiprune_prompt`` too. Attaching it via mm kwargs deliberately
-        makes the mm-cache hash prompt-dependent — the same image pruned
-        under a different prompt keeps different tokens. Other methods
-        never attach it, so their cache behavior is unchanged.
+        Under ``HIPRUNE_METHOD=hiprune_pp`` (text-relevance guidance) and
+        ``HIPRUNE_METHOD=dart`` (text pivots for the duplication test)
+        the selection is prompt-aware, so the text of the latest user
+        message is attached as ``hiprune_prompt`` too. Attaching it via
+        mm kwargs deliberately makes the mm-cache hash prompt-dependent —
+        the same image pruned under a different prompt keeps different
+        tokens. Other methods never attach it, so their cache behavior
+        is unchanged.
         """
         if self.token_pruning is not None:
             self.mm_processor_kwargs = {
@@ -998,7 +1000,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             }
             from vllm.multimodal.hiprune import get_hiprune_method
 
-            if get_hiprune_method() == "hiprune_pp":
+            if get_hiprune_method() in ("hiprune_pp", "dart"):
                 prompt = self._extract_latest_user_text()
                 if prompt:
                     self.mm_processor_kwargs["hiprune_prompt"] = prompt

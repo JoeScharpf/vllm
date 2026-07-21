@@ -97,20 +97,29 @@ HYDART_BLOCK_SIZE = 8
 # the models when evaluating Hiprune++."
 DEFAULT_HIPRUNE_PP_BETA = 0.1
 
+# DART pivot counts, from the official eval scripts
+# (DART/Qwen2_5-VL/eval_scripts/lmms_eval.sh: pivot_image_token=4,
+# pivot_text_token=4) and the LLM layer whose states drive selection
+# (pruned_layer=2: the official code prunes when entering layer index 2,
+# using the outputs of layer index 1 — i.e. after running 2 layers).
+DEFAULT_DART_PIVOT_IMAGE = 4
+DEFAULT_DART_PIVOT_TEXT = 4
+DEFAULT_DART_LAYER = 2
+
 
 def get_hiprune_method() -> str:
     """Selection method for ``--enable-hiprune`` servers.
 
-    ``HIPRUNE_METHOD=hiprune`` (default), ``hydart`` or ``hiprune_pp``.
-    Read from the environment at call time so one env var switches the
-    whole server; the per-request ``token_pruning`` field stays a plain
-    keep-ratio.
+    ``HIPRUNE_METHOD=hiprune`` (default), ``hydart``, ``hiprune_pp`` or
+    ``dart``. Read from the environment at call time so one env var
+    switches the whole server; the per-request ``token_pruning`` field
+    stays a plain keep-ratio.
     """
     method = os.environ.get("HIPRUNE_METHOD", "hiprune").lower()
-    if method not in ("hiprune", "hydart", "hiprune_pp"):
+    if method not in ("hiprune", "hydart", "hiprune_pp", "dart"):
         raise ValueError(
-            "HIPRUNE_METHOD must be 'hiprune', 'hydart' or 'hiprune_pp', "
-            f"got {method!r}"
+            "HIPRUNE_METHOD must be 'hiprune', 'hydart', 'hiprune_pp' or "
+            f"'dart', got {method!r}"
         )
     return method
 
@@ -118,6 +127,26 @@ def get_hiprune_method() -> str:
 def get_hiprune_pp_beta() -> float:
     """HiPrune++ text-guidance proportion from env, with paper default."""
     return float(os.environ.get("HIPRUNE_PP_BETA", DEFAULT_HIPRUNE_PP_BETA))
+
+
+def get_dart_pivots() -> tuple[int, int]:
+    """(pivot_image, pivot_text) counts from env, with paper defaults."""
+    p_img = int(os.environ.get("HIPRUNE_DART_PIVOT_IMAGE", DEFAULT_DART_PIVOT_IMAGE))
+    p_txt = int(os.environ.get("HIPRUNE_DART_PIVOT_TEXT", DEFAULT_DART_PIVOT_TEXT))
+    if p_img < 1 or p_txt < 0:
+        raise ValueError(
+            "DART pivots must satisfy pivot_image >= 1 and pivot_text >= 0, "
+            f"got ({p_img}, {p_txt})"
+        )
+    return p_img, p_txt
+
+
+def get_dart_layer() -> int:
+    """Number of LLM decoder layers run for DART scoring (paper: 2)."""
+    layer = int(os.environ.get("HIPRUNE_DART_LAYER", DEFAULT_DART_LAYER))
+    if layer < 1:
+        raise ValueError(f"HIPRUNE_DART_LAYER must be >= 1, got {layer}")
+    return layer
 
 
 def get_hydart_lambdas() -> tuple[float, float]:
@@ -216,6 +245,188 @@ def compute_hiprune_pp_budget(
     base = compute_retained_tokens_count(num_tokens, pruning_ratio)
     t_sum = round(base * beta)
     return base, max(0, min(t_sum, num_tokens - base))
+
+
+def dart_keep_count(
+    num_tokens: int,
+    pruning_ratio: float,
+    pivot_image: int | None = None,
+    pivot_text: int | None = None,
+) -> int:
+    """Number of image tokens DART keeps — deterministic, prompt-free.
+
+    Exact arithmetic from the official implementation
+    (``DART/Qwen2_5-VL/.../modeling_qwen2_5_vl_self.py``):
+    ``TOKEN_TOPK = int(L * retention / (p_img + p_txt))`` and the final
+    kept set is the image pivots plus ``(p_img + p_txt)`` disjoint
+    anti-duplication picks of ``TOKEN_TOPK`` tokens each (text pivots are
+    dropped from the set at the end, being text). Note the official
+    ``reduction_ratio`` is the fraction *removed*; ``pruning_ratio`` here
+    follows this codebase's request semantics (fraction KEPT), i.e.
+    ``retention = 1 - reduction_ratio``.
+
+    Clamped to ``[1, num_tokens]`` (the official code would crash on the
+    rare boundary where the pick rounds exceed the candidate pool).
+
+    Called by both the multimodal processor (placeholder sizing) and
+    :func:`dart_select`, so the two can never disagree. The count never
+    depends on the prompt: a missing/short prompt only changes *which*
+    tokens fill the budget (see the top-up rule in :func:`dart_select`).
+    """
+    if pivot_image is None or pivot_text is None:
+        env_img, env_txt = get_dart_pivots()
+        pivot_image = env_img if pivot_image is None else pivot_image
+        pivot_text = env_txt if pivot_text is None else pivot_text
+    p_img_eff = min(pivot_image, num_tokens)
+    token_topk = int(
+        num_tokens * pruning_ratio / (pivot_image + pivot_text)
+    )
+    kept = p_img_eff + (pivot_image + pivot_text) * token_topk
+    return max(1, min(num_tokens, kept))
+
+
+def dart_select(
+    hidden_states: torch.Tensor,
+    key_l1_norms: torch.Tensor,
+    num_image_tokens: int,
+    pruning_ratio: float,
+    pivot_image: int | None = None,
+    pivot_text: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """DART: duplication-aware selection from layer-K LLM states.
+
+    Verbatim port of the official ``get_retained_image_token``
+    (arXiv 2502.11494, EMNLP'25): pick the ``pivot_image`` image tokens
+    and ``pivot_text`` text tokens with the largest attention-key L1
+    norms as pivots, then for each pivot keep the ``TOKEN_TOPK``
+    remaining image tokens *least* cosine-similar to it (anti-
+    duplication), removing them from the candidate pool as they are
+    picked. Image pivots are kept; text pivots only guide selection.
+
+    Deviations from the official code, all deliberate:
+
+    - **Pivot iteration order** is image pivots then text pivots, each
+      ascending by index. The official code iterates a Python ``set``
+      (arbitrary order); order slightly influences which pivot claims a
+      contested token, so we fix a deterministic one.
+    - **Top-up rule**: if the pivot rounds cannot fill the budget — no
+      prompt (no text pivots), a prompt shorter than ``pivot_text``
+      tokens, or the boundary clamp in :func:`dart_keep_count` — the
+      remainder is filled by key-L1-norm rank over the remaining
+      candidates. The official code has no such path (it would crash);
+      this keeps the kept count equal to :func:`dart_keep_count` always,
+      which the placeholder machinery requires.
+
+    Args:
+        hidden_states: ``(seq, hidden)`` — the aux scoring pass output
+            for image tokens followed by prompt tokens, with the model's
+            final norm applied (matching ``self.norm(layer_outputs[0])``
+            in the official code). Any float dtype.
+        key_l1_norms: ``(seq,)`` — per-token L1 norm of the layer-(K−1)
+            post-RoPE attention keys, flattened across kv heads
+            (``torch.norm(k, p=1, dim=-1)`` on ``(seq, kv_heads*head_dim)``).
+        num_image_tokens: image tokens occupy ``[0, num_image_tokens)``;
+            everything after is prompt text.
+        pruning_ratio: retention ratio in ``(0, 1]``.
+        pivot_image / pivot_text: pivot counts; ``None`` reads the env
+            (``HIPRUNE_DART_PIVOT_IMAGE/TEXT``, paper defaults 4/4).
+
+    Returns:
+        ``(image_pivot_idx, text_pivot_idx, diverse_idx, kept_mask,
+        pivot_similarity)``. ``text_pivot_idx`` is prompt-relative
+        (0 = first prompt token). ``kept_mask`` is over image tokens
+        with exactly ``dart_keep_count(...)`` True entries.
+        ``pivot_similarity[i]`` is image token *i*'s max cosine
+        similarity to any pivot (high = duplicated by a pivot; kept
+        diverse tokens have low values), for metadata/tooltips.
+    """
+    if pivot_image is None or pivot_text is None:
+        env_img, env_txt = get_dart_pivots()
+        pivot_image = env_img if pivot_image is None else pivot_image
+        pivot_text = env_txt if pivot_text is None else pivot_text
+
+    seq_len = hidden_states.shape[0]
+    num_text = seq_len - num_image_tokens
+    device = hidden_states.device
+
+    budget = dart_keep_count(
+        num_image_tokens, pruning_ratio, pivot_image, pivot_text
+    )
+    token_topk = int(
+        num_image_tokens * pruning_ratio / (pivot_image + pivot_text)
+    )
+
+    norms = key_l1_norms.float()
+    p_img_eff = min(pivot_image, num_image_tokens)
+    image_pivot_idx = torch.topk(norms[:num_image_tokens], k=p_img_eff).indices
+    p_txt_eff = min(pivot_text, num_text)
+    if p_txt_eff > 0:
+        text_pivot_rel = torch.topk(norms[num_image_tokens:], k=p_txt_eff).indices
+    else:
+        text_pivot_rel = torch.empty(0, dtype=torch.long, device=device)
+
+    # hidden_states already carries the final norm; cosine similarity
+    # additionally normalizes, exactly like the official F.cosine_similarity.
+    hs = torch.nn.functional.normalize(hidden_states.float(), dim=-1)
+
+    pivot_order = torch.cat(
+        [
+            image_pivot_idx.sort().values,
+            text_pivot_rel.sort().values + num_image_tokens,
+        ]
+    )
+    pivot_similarity = (
+        (hs[:num_image_tokens] @ hs[pivot_order].T).max(dim=-1).values
+        if pivot_order.numel()
+        else torch.zeros(num_image_tokens, device=device)
+    )
+
+    candidates = torch.ones(num_image_tokens, dtype=torch.bool, device=device)
+    candidates[image_pivot_idx] = False
+
+    diverse_total = budget - p_img_eff
+    remaining = diverse_total
+    diverse_chunks: list[torch.Tensor] = []
+    for pivot in pivot_order:
+        if remaining <= 0:
+            break
+        cand_idx = candidates.nonzero(as_tuple=True)[0]
+        k = min(token_topk, remaining, int(cand_idx.numel()))
+        if k <= 0:
+            break
+        # Official: cos_sim = -cosine_similarity(pivot, candidates);
+        # topk of the negation keeps the LEAST similar (anti-duplication).
+        sims = hs[cand_idx] @ hs[pivot]
+        picked = cand_idx[torch.topk(-sims, k=k).indices]
+        diverse_chunks.append(picked)
+        candidates[picked] = False
+        remaining -= k
+
+    if remaining > 0:
+        # Top-up (missing/short prompt or boundary clamp): fill by key
+        # L1-norm rank, deterministic and prompt-free.
+        cand_idx = candidates.nonzero(as_tuple=True)[0]
+        k = min(remaining, int(cand_idx.numel()))
+        if k > 0:
+            picked = cand_idx[
+                torch.topk(norms[:num_image_tokens][cand_idx], k=k).indices
+            ]
+            diverse_chunks.append(picked)
+            candidates[picked] = False
+            remaining -= k
+
+    if diverse_chunks:
+        diverse_idx = torch.cat(diverse_chunks)
+    else:
+        diverse_idx = torch.empty(0, dtype=torch.long, device=device)
+
+    kept_mask = torch.zeros(num_image_tokens, dtype=torch.bool, device=device)
+    kept_mask[image_pivot_idx] = True
+    kept_mask[diverse_idx] = True
+    assert int(kept_mask.sum()) == budget, (
+        f"DART kept {int(kept_mask.sum())} tokens, budget is {budget}"
+    )
+    return image_pivot_idx, text_pivot_rel, diverse_idx, kept_mask, pivot_similarity
 
 
 def compute_soft_token_grid(
@@ -735,6 +946,71 @@ def build_hiprune_pp_metadata(
             "object_layer": shallow_scores.float().tolist(),
             "deep_layer": deep_scores.float().tolist(),
             "text_similarity": text_similarity.float().tolist(),
+        },
+    }
+
+
+def build_dart_metadata(
+    image_pivot_idx: torch.Tensor,
+    diverse_idx: torch.Tensor,
+    kept_mask: torch.Tensor,
+    key_l1_norms: torch.Tensor,
+    pivot_similarity: torch.Tensor,
+    grid_w: int,
+    grid_h: int,
+    retention: float,
+    pivot_image: int,
+    pivot_text: int,
+    num_text_pivots: int,
+    dart_layer: int,
+) -> dict[str, object]:
+    """JSON-safe per-image DART metadata for API reporting.
+
+    Categories: ``pivot`` (image pivots, kept) and ``diverse``
+    (anti-duplication picks). Per-token score arrays for tooltips: the
+    layer-(K−1) attention-key L1 norm (the pivot-selection statistic)
+    and each token's max cosine similarity to the pivots (high =
+    duplicated by a pivot — likely pruned; low = novel — likely kept).
+    ``num_text_pivots`` reports how many text pivots actually guided
+    selection (0 when the prompt was missing/empty).
+    """
+
+    def _mean(scores: torch.Tensor, idx: torch.Tensor) -> float | None:
+        return float(scores[idx].mean()) if idx.numel() else None
+
+    num_tokens = int(kept_mask.shape[0])
+    image_key_norms = key_l1_norms.float()[:num_tokens]
+    pruned_idx = (~kept_mask).nonzero(as_tuple=True)[0]
+    kept_idx = kept_mask.nonzero(as_tuple=True)[0]
+    categories = {
+        "pivot": image_pivot_idx,
+        "diverse": diverse_idx,
+        "kept": kept_idx,
+        "pruned": pruned_idx,
+    }
+    return {
+        "method": "dart",
+        "grid": [grid_w, grid_h],
+        "num_tokens": num_tokens,
+        "retention": retention,
+        "pivot_image": pivot_image,
+        "pivot_text": pivot_text,
+        "num_text_pivots": num_text_pivots,
+        "dart_layer": dart_layer,
+        "pruned": pruned_idx.tolist(),
+        "pivots": image_pivot_idx.tolist(),
+        "diverse": diverse_idx.tolist(),
+        "key_norm_summary": {
+            name: _mean(image_key_norms, idx) for name, idx in categories.items()
+        },
+        "similarity": {
+            "kept_vs_pivots": _mean(pivot_similarity, kept_idx),
+            "pruned_vs_pivots": _mean(pivot_similarity, pruned_idx),
+        },
+        # Per-token arrays for hover tooltips (index = soft-token index).
+        "scores": {
+            "key_norm": image_key_norms.tolist(),
+            "pivot_similarity": pivot_similarity.float().tolist(),
         },
     }
 

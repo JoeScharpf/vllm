@@ -44,15 +44,21 @@ from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.transformers.utils import recursive_replace_linear
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.dart_scoring import dart_prefix_states_gemma
 from vllm.multimodal.hiprune import (
     GEMMA4_OBJECT_LAYER,
     aggregate_patch_attention,
+    build_dart_metadata,
     build_hiprune_metadata,
     build_hiprune_pp_metadata,
     build_hydart_metadata,
     compute_hiprune_pp_budget,
     compute_retained_tokens_count,
     compute_soft_token_grid,
+    dart_keep_count,
+    dart_select,
+    get_dart_layer,
+    get_dart_pivots,
     get_hiprune_method,
     get_hiprune_prompt as _get_hiprune_prompt,
     get_hiprune_ratio as _get_hiprune_ratio,
@@ -128,13 +134,17 @@ def _hiprune_keep_count(num_soft: int, hiprune_ratio: float) -> int:
     """Soft tokens kept for an image under the active HIPRUNE_METHOD.
 
     HiPrune and HyDART keep the plain retained-token budget; HiPrune++
-    adds the text-guided tokens on top (additive, per the paper). Shared
-    by every placeholder-sizing site in this file so the prompt side can
-    never disagree with the model's selection.
+    adds the text-guided tokens on top (additive, per the paper); DART
+    uses the official pivot-round arithmetic. Shared by every
+    placeholder-sizing site in this file so the prompt side can never
+    disagree with the model's selection.
     """
-    if get_hiprune_method() == "hiprune_pp":
+    method = get_hiprune_method()
+    if method == "hiprune_pp":
         base, t_sum = compute_hiprune_pp_budget(num_soft, hiprune_ratio)
         return base + t_sum
+    if method == "dart":
+        return dart_keep_count(num_soft, hiprune_ratio)
     return compute_retained_tokens_count(num_soft, hiprune_ratio)
 
 
@@ -851,11 +861,11 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
             processed_outputs["hiprune_ratio"] = torch.full(
                 (num_images,), hiprune_ratio, dtype=torch.float32
             )
-            # HiPrune++: ship the prompt token ids to the model so it can
-            # embed them (LM embedding table) for text-guided selection.
-            # One identical row per image — the mm field machinery is
-            # per-item.
-            if get_hiprune_method() == "hiprune_pp":
+            # HiPrune++ / DART: ship the prompt token ids to the model so
+            # it can embed them (LM embedding table) for text-guided
+            # selection (HiPrune++) or text pivots (DART). One identical
+            # row per image — the mm field machinery is per-item.
+            if get_hiprune_method() in ("hiprune_pp", "dart"):
                 hiprune_prompt = _get_hiprune_prompt(merged_kwargs)
                 tokenizer = self.info.get_tokenizer()
                 ids = (
@@ -1563,7 +1573,10 @@ class Gemma4ForConditionalGeneration(
                     pad_tensor,
                 ).to(self.model_dtype)
 
-                chunk_needs_pruning = any(
+                # DART needs no vision-tower attention (its selection
+                # runs on LLM layer-K states), so the plain encoder
+                # path suffices even for pruned images.
+                chunk_needs_pruning = method != "dart" and any(
                     ratios[item[0]] is not None for item in chunk_items
                 )
                 if chunk_needs_pruning:
@@ -1635,7 +1648,84 @@ class Gemma4ForConditionalGeneration(
                 valid_states = (valid_states - vt.std_bias) * vt.std_scale
 
             ratio = ratios[orig_idx]
-            if ratio is not None:
+            if ratio is not None and method == "dart":
+                # DART: no vision-tower attention. Project this image's
+                # soft tokens to LM space, run the language model's first
+                # K decoder layers over [image tokens, prompt tokens]
+                # (aux pass, vllm/multimodal/dart_scoring.py) and select
+                # with the official pivot + anti-duplication arithmetic.
+                _, grid_w, grid_h, _ = compute_soft_token_grid(
+                    pixel_position_ids[orig_idx], pooling_k
+                )
+                num_soft = valid_states.shape[0]
+                assert grid_w * grid_h == num_soft, (
+                    f"soft-token grid {grid_w}x{grid_h} != pooled "
+                    f"soft-token count {num_soft}"
+                )
+                lm_embeds = self.embed_vision(
+                    inputs_embeds=valid_states.to(self.model_dtype).unsqueeze(0)
+                ).squeeze(0)
+                lm = self.language_model.model
+                pid = prompt_ids[orig_idx]
+                if pid is not None:
+                    ids = pid.long().to(lm_embeds.device)
+                    # Text tokens enter the LM scaled by sqrt(hidden),
+                    # exactly like the real forward's embed path.
+                    text_embeds = lm.embed_input_ids(ids).to(lm_embeds.dtype)
+                else:
+                    ids = torch.empty(
+                        0, dtype=torch.long, device=lm_embeds.device
+                    )
+                    text_embeds = lm_embeds.new_zeros((0, lm_embeds.shape[-1]))
+                seq_embeds = torch.cat([lm_embeds, text_embeds], dim=0)
+                positions = torch.arange(
+                    seq_embeds.shape[0], device=seq_embeds.device
+                )
+                # Per-layer inputs (PLE): image positions use token id 0,
+                # the same masking embed_input_ids applies to multimodal
+                # positions in the real forward.
+                ple_ids = torch.cat(
+                    [
+                        torch.zeros(
+                            num_soft, dtype=torch.long, device=seq_embeds.device
+                        ),
+                        ids,
+                    ]
+                )
+                ple_raw = lm.get_per_layer_inputs(ple_ids)
+                per_layer_inputs = lm.project_per_layer_inputs(
+                    seq_embeds, ple_raw
+                )
+                dart_layer = get_dart_layer()
+                hidden, key_l1 = dart_prefix_states_gemma(
+                    lm.layers,
+                    lm.norm,
+                    seq_embeds,
+                    positions,
+                    per_layer_inputs,
+                    dart_layer,
+                    num_soft,
+                )
+                p_img, p_txt = get_dart_pivots()
+                img_piv, txt_piv, diverse_idx, kept_mask, pivot_sim = (
+                    dart_select(hidden, key_l1, num_soft, ratio, p_img, p_txt)
+                )
+                valid_states = valid_states[kept_mask]
+                hiprune_metadata[orig_idx] = build_dart_metadata(
+                    img_piv,
+                    diverse_idx,
+                    kept_mask,
+                    key_l1,
+                    pivot_sim,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    pivot_image=p_img,
+                    pivot_text=p_txt,
+                    num_text_pivots=int(txt_piv.numel()),
+                    dart_layer=dart_layer,
+                )
+            elif ratio is not None:
                 shallow, deep, grid_w, grid_h = hiprune_scores_map[orig_idx]
                 num_soft = valid_states.shape[0]
                 assert shallow.shape[0] == num_soft, (

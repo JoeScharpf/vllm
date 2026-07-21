@@ -9,13 +9,18 @@ from vllm.multimodal.hiprune import (
     LLAVA_OBJECT_LAYER,
     QWEN2_5_VL_OBJECT_LAYER,
     aggregate_patch_attention,
+    build_dart_metadata,
     build_hiprune_metadata,
     build_hiprune_pp_metadata,
     build_hydart_metadata,
     compute_hiprune_pp_budget,
     compute_retained_tokens_count,
     compute_soft_token_grid,
+    dart_keep_count,
+    dart_select,
     fold_merged_token_scores,
+    get_dart_layer,
+    get_dart_pivots,
     get_hiprune_method,
     get_hiprune_prompt,
     get_hiprune_ratio,
@@ -814,6 +819,8 @@ def test_get_hiprune_method_env(monkeypatch):
     assert get_hiprune_method() == "hydart"
     monkeypatch.setenv("HIPRUNE_METHOD", "hiprune_pp")
     assert get_hiprune_method() == "hiprune_pp"
+    monkeypatch.setenv("HIPRUNE_METHOD", "dart")
+    assert get_hiprune_method() == "dart"
     monkeypatch.setenv("HIPRUNE_METHOD", "bogus")
     with pytest.raises(ValueError):
         get_hiprune_method()
@@ -1023,3 +1030,287 @@ def test_get_hiprune_pp_beta_env(monkeypatch):
     assert get_hiprune_pp_beta() == pytest.approx(0.1)
     monkeypatch.setenv("HIPRUNE_PP_BETA", "0.25")
     assert get_hiprune_pp_beta() == pytest.approx(0.25)
+
+
+# --------------------------------------------------------------------------
+# DART (duplication-aware selection from LLM layer-K states)
+# --------------------------------------------------------------------------
+
+
+def _dart_reference(
+    hidden_states: torch.Tensor,
+    key_l1_norms: torch.Tensor,
+    num_image_tokens: int,
+    ratio: float,
+    p_img: int,
+    p_txt: int,
+) -> set[int]:
+    """Line-for-line port of the official ``get_retained_image_token``
+    (DART/Qwen2_5-VL/Qwen2_5VL_DART/modeling_qwen2_5_vl_self.py), on the
+    flat aux-sequence layout (image tokens at [0, num_image_tokens), text
+    after) and with the pivot iteration order fixed to sorted image
+    pivots then sorted text pivots — the only free choice in the official
+    code, where ``for item in list(indices_set)`` iterates a Python set.
+    """
+    image_token_start_index = 0
+    image_token_length = num_image_tokens
+    token_topk = int(image_token_length * ratio / (p_img + p_txt))
+
+    norms_img = key_l1_norms[:num_image_tokens]
+    norms_txt = key_l1_norms[num_image_tokens:]
+    image_indices = sorted(
+        (norms_img.topk(p_img).indices + image_token_start_index).tolist()
+    )
+    query_indices = sorted(
+        (
+            norms_txt.topk(p_txt).indices
+            + image_token_start_index
+            + image_token_length
+        ).tolist()
+    )
+    indices_set = set(image_indices + query_indices)
+    valid_indices = set(
+        range(image_token_start_index, image_token_start_index + image_token_length)
+    ) - set(image_indices)
+
+    valid_indices_list = list(valid_indices)
+    for item in image_indices + query_indices:  # deterministic order
+        valid_vectors = hidden_states[valid_indices_list, :]
+        cos_sim = -torch.nn.functional.cosine_similarity(
+            hidden_states[item, :], valid_vectors, dim=-1
+        )
+        top_k_indices = cos_sim.topk(token_topk).indices
+        top_k_real_indices = [valid_indices_list[i] for i in top_k_indices]
+        indices_set.update(top_k_real_indices)
+        valid_indices.difference_update(top_k_real_indices)
+        valid_indices_list = list(valid_indices)
+
+    indices_set.difference_update(query_indices)
+    return indices_set
+
+
+def _dart_case(seed: int, n_img: int = 260, n_txt: int = 24, hidden: int = 64):
+    torch.manual_seed(seed)
+    hs = torch.randn(n_img + n_txt, hidden)
+    key_l1 = torch.rand(n_img + n_txt) * 10
+    return hs, key_l1
+
+
+@pytest.mark.parametrize("num_tokens", [1, 12, 255, 260, 576, 1280])
+@pytest.mark.parametrize("ratio", [0.05, 0.11, 0.14, 0.223, 0.5, 0.95, 1.0])
+def test_dart_keep_count_bounds(num_tokens: int, ratio: float):
+    kept = dart_keep_count(num_tokens, ratio, 4, 4)
+    assert 1 <= kept <= num_tokens
+    # Official formula whenever it lands in range.
+    token_topk = int(num_tokens * ratio / 8)
+    official = min(4, num_tokens) + 8 * token_topk
+    assert kept == max(1, min(num_tokens, official))
+
+
+@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("ratio", [0.11, 0.14, 0.25, 0.5])
+def test_dart_matches_official_reference(seed: int, ratio: float):
+    """dart_select must keep exactly the official implementation's set
+    (same pivot order), validating the verbatim port."""
+    n_img, n_txt = 260, 24
+    hs, key_l1 = _dart_case(seed, n_img, n_txt)
+
+    img_piv, txt_piv, diverse, kept, _ = dart_select(
+        hs, key_l1, n_img, ratio, pivot_image=4, pivot_text=4
+    )
+    ref = _dart_reference(hs, key_l1, n_img, ratio, 4, 4)
+    assert set(kept.nonzero(as_tuple=True)[0].tolist()) == ref
+
+
+@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("ratio", [0.11, 0.14, 0.25, 0.5])
+@pytest.mark.parametrize("pivots", [(4, 4), (2, 6), (4, 0), (1, 1)])
+def test_dart_invariants(seed: int, ratio: float, pivots: tuple[int, int]):
+    p_img, p_txt = pivots
+    n_img, n_txt = 260, 24
+    hs, key_l1 = _dart_case(seed, n_img, n_txt)
+
+    img_piv, txt_piv, diverse, kept, sim = dart_select(
+        hs, key_l1, n_img, ratio, pivot_image=p_img, pivot_text=p_txt
+    )
+
+    # Exact deterministic budget (the placeholder invariant).
+    assert kept.sum().item() == dart_keep_count(n_img, ratio, p_img, p_txt)
+
+    # Image pivots + diverse partition the kept set, no duplicates.
+    all_idx = torch.cat([img_piv, diverse])
+    assert all_idx.unique().numel() == all_idx.numel()
+    mask = torch.zeros(n_img, dtype=torch.bool)
+    mask[all_idx] = True
+    assert torch.equal(mask, kept)
+
+    # Image pivots are the top-p_img by key L1 norm.
+    expected_piv = torch.topk(key_l1[:n_img], k=min(p_img, n_img)).indices
+    assert set(img_piv.tolist()) == set(expected_piv.tolist())
+
+    # Text pivots are prompt-relative and within the prompt.
+    assert txt_piv.numel() == min(p_txt, n_txt)
+    if txt_piv.numel():
+        assert txt_piv.max() < n_txt
+
+    # Similarity stats cover every image token, in [-1, 1].
+    assert sim.shape == (n_img,)
+    assert (sim >= -1.0 - 1e-5).all() and (sim <= 1.0 + 1e-5).all()
+
+
+def test_dart_deterministic():
+    hs, key_l1 = _dart_case(7)
+    first = dart_select(hs, key_l1, 260, 0.14, pivot_image=4, pivot_text=4)
+    second = dart_select(hs, key_l1, 260, 0.14, pivot_image=4, pivot_text=4)
+    for a, b in zip(first, second):
+        assert torch.equal(a, b)
+
+
+def test_dart_prompt_awareness():
+    """Changing the text tokens must be able to change the kept set."""
+    torch.manual_seed(21)
+    n_img, n_txt, hidden = 260, 24, 64
+    img_hs = torch.randn(n_img, hidden)
+    key_img = torch.rand(n_img) * 10
+
+    kept_sets = set()
+    for text_seed in range(4):
+        torch.manual_seed(100 + text_seed)
+        txt_hs = torch.randn(n_txt, hidden)
+        key_txt = torch.rand(n_txt) * 10
+        hs = torch.cat([img_hs, txt_hs])
+        key_l1 = torch.cat([key_img, key_txt])
+        _, _, _, kept, _ = dart_select(
+            hs, key_l1, n_img, 0.14, pivot_image=4, pivot_text=4
+        )
+        kept_sets.add(tuple(kept.nonzero(as_tuple=True)[0].tolist()))
+    assert len(kept_sets) > 1
+
+
+def test_dart_no_prompt_top_up():
+    """Zero text tokens: image pivots alone under-fill the pivot rounds;
+    the top-up must still hit the exact deterministic budget."""
+    torch.manual_seed(3)
+    n_img, hidden = 260, 64
+    hs = torch.randn(n_img, hidden)  # no text rows at all
+    key_l1 = torch.rand(n_img) * 10
+
+    img_piv, txt_piv, diverse, kept, _ = dart_select(
+        hs, key_l1, n_img, 0.14, pivot_image=4, pivot_text=4
+    )
+    assert txt_piv.numel() == 0
+    # Budget still computed with pivot_text=4 (prompt-free invariant).
+    assert kept.sum().item() == dart_keep_count(n_img, 0.14, 4, 4)
+
+
+def test_dart_short_prompt_top_up():
+    """Prompt shorter than pivot_text: fewer text pivots, same count."""
+    hs, key_l1 = _dart_case(5, n_img=260, n_txt=2)
+    img_piv, txt_piv, diverse, kept, _ = dart_select(
+        hs, key_l1, 260, 0.14, pivot_image=4, pivot_text=4
+    )
+    assert txt_piv.numel() == 2
+    assert kept.sum().item() == dart_keep_count(260, 0.14, 4, 4)
+
+
+def test_dart_full_retention_keeps_everything():
+    hs, key_l1 = _dart_case(9, n_img=256)
+    _, _, _, kept, _ = dart_select(hs, key_l1, 256, 1.0, pivot_image=4, pivot_text=4)
+    assert kept.all()
+
+
+def test_dart_diverse_avoids_pivot_duplicates():
+    """Tokens near-identical to the pivot must lose to novel tokens.
+
+    Single image pivot, no text pivots, so the pivot's own
+    anti-duplication round fills the whole budget and its clones are
+    deterministically the *worst* candidates.
+    """
+    torch.manual_seed(17)
+    n_img, hidden = 200, 64
+    hs = torch.randn(n_img, hidden)
+    key_l1 = torch.rand(n_img)
+    # Make token 0 the sole pivot and tokens 1..40 its clones.
+    key_l1[0] = 100.0
+    hs[1:41] = hs[0] + 0.001 * torch.randn(40, hidden)
+
+    _, _, diverse, kept, sim = dart_select(
+        hs, key_l1, n_img, 0.25, pivot_image=1, pivot_text=0
+    )
+    # Budget = 1 + 50; 159 non-clone candidates exist, all less similar
+    # to the pivot than any clone, so no clone survives.
+    assert kept[0]  # the pivot itself
+    assert kept[1:41].sum().item() == 0
+    assert sim[1:41].min() > 0.99  # clones flagged as duplicated
+
+
+def test_dart_metadata_contents():
+    import json
+
+    hs, key_l1 = _dart_case(13)
+    n_img, grid_w, grid_h, ratio = 260, 20, 13, 0.14
+    img_piv, txt_piv, diverse, kept, sim = dart_select(
+        hs, key_l1, n_img, ratio, pivot_image=4, pivot_text=4
+    )
+    md = build_dart_metadata(
+        img_piv,
+        diverse,
+        kept,
+        key_l1,
+        sim,
+        grid_w,
+        grid_h,
+        ratio,
+        pivot_image=4,
+        pivot_text=4,
+        num_text_pivots=int(txt_piv.numel()),
+        dart_layer=2,
+    )
+    json.dumps(md)  # must be JSON-safe
+
+    assert md["method"] == "dart"
+    assert md["grid"] == [grid_w, grid_h]
+    assert md["num_tokens"] == n_img
+    assert md["pivot_image"] == 4 and md["pivot_text"] == 4
+    assert md["num_text_pivots"] == 4
+    assert md["dart_layer"] == 2
+    assert sorted(md["pivots"]) == sorted(img_piv.tolist())
+    assert sorted(md["diverse"]) == sorted(diverse.tolist())
+    kept_count = dart_keep_count(n_img, ratio, 4, 4)
+    assert len(md["pruned"]) == n_img - kept_count
+    # Categories partition all tokens.
+    all_reported = md["pivots"] + md["diverse"] + md["pruned"]
+    assert sorted(all_reported) == list(range(n_img))
+    # Per-token arrays for tooltips (image tokens only).
+    assert len(md["scores"]["key_norm"]) == n_img
+    assert len(md["scores"]["pivot_similarity"]) == n_img
+    # Summary means are consistent with the per-token arrays.
+    ps = torch.tensor(md["scores"]["pivot_similarity"])
+    assert md["similarity"]["kept_vs_pivots"] == pytest.approx(
+        float(ps[kept].mean()), abs=1e-6
+    )
+    assert md["similarity"]["pruned_vs_pivots"] == pytest.approx(
+        float(ps[~kept].mean()), abs=1e-6
+    )
+
+
+def test_get_dart_pivots_env(monkeypatch):
+    monkeypatch.delenv("HIPRUNE_DART_PIVOT_IMAGE", raising=False)
+    monkeypatch.delenv("HIPRUNE_DART_PIVOT_TEXT", raising=False)
+    assert get_dart_pivots() == (4, 4)
+    monkeypatch.setenv("HIPRUNE_DART_PIVOT_IMAGE", "2")
+    monkeypatch.setenv("HIPRUNE_DART_PIVOT_TEXT", "6")
+    assert get_dart_pivots() == (2, 6)
+    monkeypatch.setenv("HIPRUNE_DART_PIVOT_IMAGE", "0")
+    with pytest.raises(ValueError):
+        get_dart_pivots()
+
+
+def test_get_dart_layer_env(monkeypatch):
+    monkeypatch.delenv("HIPRUNE_DART_LAYER", raising=False)
+    assert get_dart_layer() == 2
+    monkeypatch.setenv("HIPRUNE_DART_LAYER", "3")
+    assert get_dart_layer() == 3
+    monkeypatch.setenv("HIPRUNE_DART_LAYER", "0")
+    with pytest.raises(ValueError):
+        get_dart_layer()

@@ -73,12 +73,21 @@ from vllm.multimodal.evs import (
     compute_retention_mask,
     recompute_mrope_positions,
 )
+from vllm.multimodal.dart_scoring import (
+    dart_prefix_states_llama,
+    qwen2_5_vl_dart_positions,
+)
 from vllm.multimodal.hiprune import (
     QWEN2_5_VL_OBJECT_LAYER,
+    build_dart_metadata,
     build_hiprune_metadata,
     build_hydart_metadata,
     build_hiprune_pp_metadata,
+    dart_keep_count,
+    dart_select,
     fold_merged_token_scores,
+    get_dart_layer,
+    get_dart_pivots,
     get_hiprune_method,
     get_hiprune_prompt,
     get_hiprune_ratio,
@@ -1412,12 +1421,13 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
             processed_outputs["hiprune_ratio"] = torch.full(
                 (num_images,), hiprune_ratio, dtype=torch.float32
             )
-            # HiPrune++: ship the prompt token ids to the model so it can
-            # embed them (LM embedding table) for text-guided selection.
+            # HiPrune++ / DART: ship the prompt token ids to the model so
+            # it can embed them (LM embedding table) for text-guided
+            # selection (HiPrune++) or text pivots (DART).
             # One identical row per image — the mm field machinery is
             # per-item. Batched fields must stack, and every row comes
             # from the same request, so lengths always agree.
-            if get_hiprune_method() == "hiprune_pp":
+            if get_hiprune_method() in ("hiprune_pp", "dart"):
                 tokenizer = self.info.get_tokenizer()
                 ids = (
                     tokenizer.encode(hiprune_prompt, add_special_tokens=False)
@@ -1481,9 +1491,12 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
             # per the paper's Algorithm 1); the count never depends on
             # the prompt content, only on ratio and beta.
             if modality == "image" and hiprune_ratio is not None:
-                if get_hiprune_method() == "hiprune_pp":
+                method = get_hiprune_method()
+                if method == "hiprune_pp":
                     base, t_sum = hiprune_pp_budget(num_tokens, hiprune_ratio)
                     num_tokens = base + t_sum
+                elif method == "dart":
+                    num_tokens = dart_keep_count(num_tokens, hiprune_ratio)
                 else:
                     num_tokens = hiprune_retained_tokens_count(
                         num_tokens, hiprune_ratio
@@ -1816,6 +1829,15 @@ class Qwen2_5_VLForConditionalGeneration(
         batch can span requests with different prompts); a missing/empty
         prompt falls back to a zero text embedding (arbitrary text picks,
         count unchanged).
+
+        DART (``HIPRUNE_METHOD=dart``) uses no vision-tower attention at
+        all: the merged embeddings and the LM embeddings of the prompt
+        run through the language model's first K decoder layers (aux
+        pass, see ``vllm/multimodal/dart_scoring.py``) and the layer-K
+        key norms / hidden states drive the official pivot +
+        anti-duplication selection. A missing prompt means no text
+        pivots; the count invariant holds via the top-up rule in
+        ``dart_select``.
         """
         merge_size = self.visual.spatial_merge_size
         object_layer_idx = QWEN2_5_VL_OBJECT_LAYER - 1
@@ -1845,6 +1867,56 @@ class Qwen2_5_VLForConditionalGeneration(
         ):
             if ratio is None:
                 image_embeds_out.append(self.visual(pv, grid_thw=[thw]))
+                continue
+
+            if method == "dart":
+                embeds = self.visual(pv, grid_thw=[thw])
+                t, h, w = thw
+                grid_h = h // merge_size
+                grid_w = w // merge_size
+                num_tokens = t * grid_h * grid_w
+                assert embeds.shape[0] == num_tokens
+
+                lm = self.language_model.model
+                pid = prompt_ids[idx] if prompt_ids is not None else None
+                if pid is not None and pid.numel():
+                    text_embeds = lm.embed_tokens(
+                        pid.long().to(embeds.device)
+                    ).to(embeds.dtype)
+                else:
+                    text_embeds = embeds.new_zeros((0, embeds.shape[-1]))
+                seq_embeds = torch.cat([embeds, text_embeds], dim=0)
+                positions = qwen2_5_vl_dart_positions(
+                    (t, h, w),
+                    merge_size,
+                    text_embeds.shape[0],
+                    embeds.device,
+                )
+                dart_layer = get_dart_layer()
+                hidden, key_l1 = dart_prefix_states_llama(
+                    lm.layers, lm.norm, seq_embeds, positions, dart_layer
+                )
+                p_img, p_txt = get_dart_pivots()
+                img_piv, txt_piv, diverse_idx, kept_mask, pivot_sim = dart_select(
+                    hidden, key_l1, num_tokens, ratio, p_img, p_txt
+                )
+                metadata = build_dart_metadata(
+                    img_piv,
+                    diverse_idx,
+                    kept_mask,
+                    key_l1,
+                    pivot_sim,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    pivot_image=p_img,
+                    pivot_text=p_txt,
+                    num_text_pivots=int(txt_piv.numel()),
+                    dart_layer=dart_layer,
+                )
+                image_embeds_out.append(embeds[kept_mask])
+                self._hiprune_kept_masks[idx] = kept_mask
+                self._hiprune_metadata[idx] = metadata
                 continue
 
             embeds, scores_by_layer = self.visual.forward_capturing_hiprune_scores(

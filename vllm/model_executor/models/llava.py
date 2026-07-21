@@ -26,11 +26,17 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelL
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import BaseMultiModalProcessorCache
+from vllm.multimodal.dart_scoring import dart_prefix_states_llama
 from vllm.multimodal.hiprune import (
     LLAVA_OBJECT_LAYER,
+    build_dart_metadata,
     build_hiprune_metadata,
     build_hiprune_pp_metadata,
     build_hydart_metadata,
+    dart_keep_count,
+    dart_select,
+    get_dart_layer,
+    get_dart_pivots,
     get_hiprune_method,
     get_hiprune_prompt,
     get_hiprune_ratio,
@@ -392,11 +398,11 @@ class LlavaMultiModalProcessor(BaseLlavaMultiModalProcessor[LlavaProcessingInfo]
             processed_outputs["hiprune_ratio"] = torch.full(
                 (num_images,), hiprune_ratio, dtype=torch.float32
             )
-            # HiPrune++: ship the prompt token ids to the model so it can
-            # embed them (LM embedding table) for text-guided selection.
-            # One identical row per image — the mm field machinery is
-            # per-item.
-            if get_hiprune_method() == "hiprune_pp":
+            # HiPrune++ / DART: ship the prompt token ids to the model so
+            # it can embed them (LM embedding table) for text-guided
+            # selection (HiPrune++) or text pivots (DART). One identical
+            # row per image — the mm field machinery is per-item.
+            if get_hiprune_method() in ("hiprune_pp", "dart"):
                 tokenizer = self.info.get_tokenizer()
                 ids = (
                     tokenizer.encode(hiprune_prompt, add_special_tokens=False)
@@ -439,11 +445,16 @@ class LlavaMultiModalProcessor(BaseLlavaMultiModalProcessor[LlavaProcessingInfo]
                 # of the base budget (additive, per the paper); the
                 # count never depends on the prompt content.
                 if hiprune_ratio is not None:
-                    if get_hiprune_method() == "hiprune_pp":
+                    method = get_hiprune_method()
+                    if method == "hiprune_pp":
                         base, t_sum = hiprune_pp_budget(
                             num_image_tokens, hiprune_ratio
                         )
                         num_image_tokens = base + t_sum
+                    elif method == "dart":
+                        num_image_tokens = dart_keep_count(
+                            num_image_tokens, hiprune_ratio
+                        )
                     else:
                         num_image_tokens = hiprune_retained_tokens_count(
                             num_image_tokens, hiprune_ratio
@@ -867,6 +878,13 @@ class LlavaForConditionalGeneration(
         prompt falls back to a zero text embedding (arbitrary text
         picks, count unchanged).
 
+        DART (``HIPRUNE_METHOD=dart``) uses no vision-tower attention:
+        the projected embeddings and the LM embeddings of the prompt run
+        through the language model's first K decoder layers (aux pass,
+        ``vllm/multimodal/dart_scoring.py``); the layer-K key norms and
+        hidden states drive the official pivot + anti-duplication
+        selection.
+
         Layer choices mirror the HiPrune authors' LLaVA-1.5 release: the
         object layer is layer 9 (1-based) of the CLIP tower, and the deep
         layer is the feature-select layer (-2, the last block vLLM loads
@@ -913,6 +931,49 @@ class LlavaForConditionalGeneration(
             if ratio is None:
                 features = self._image_pixels_to_features(tower, pv)
                 image_embeds_out.append(self.multi_modal_projector(features)[0])
+                continue
+
+            if method == "dart":
+                features = self._image_pixels_to_features(tower, pv)
+                embeds = self.multi_modal_projector(features)[0]
+                assert embeds.shape[0] == num_tokens
+
+                lm = self.language_model.model
+                pid = prompt_ids[idx] if prompt_ids is not None else None
+                if pid is not None and pid.numel():
+                    text_embeds = lm.embed_tokens(
+                        pid.long().to(embeds.device)
+                    ).to(embeds.dtype)
+                else:
+                    text_embeds = embeds.new_zeros((0, embeds.shape[-1]))
+                seq_embeds = torch.cat([embeds, text_embeds], dim=0)
+                positions = torch.arange(
+                    seq_embeds.shape[0], device=embeds.device
+                )
+                dart_layer = get_dart_layer()
+                hidden, key_l1 = dart_prefix_states_llama(
+                    lm.layers, lm.norm, seq_embeds, positions, dart_layer
+                )
+                p_img, p_txt = get_dart_pivots()
+                img_piv, txt_piv, diverse_idx, kept_mask, pivot_sim = (
+                    dart_select(hidden, key_l1, num_tokens, ratio, p_img, p_txt)
+                )
+                metadata = build_dart_metadata(
+                    img_piv,
+                    diverse_idx,
+                    kept_mask,
+                    key_l1,
+                    pivot_sim,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    pivot_image=p_img,
+                    pivot_text=p_txt,
+                    num_text_pivots=int(txt_piv.numel()),
+                    dart_layer=dart_layer,
+                )
+                image_embeds_out.append(embeds[kept_mask])
+                self._hiprune_metadata[idx] = metadata
                 continue
 
             features, scores_by_layer = tower.forward_capturing_hiprune_scores(
