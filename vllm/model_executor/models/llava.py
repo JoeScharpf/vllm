@@ -38,12 +38,16 @@ from vllm.multimodal.hiprune import (
     get_dart_layer,
     get_dart_pivots,
     get_hiprune_method,
+    get_hiprune_pp_beta,
     get_hiprune_prompt,
     get_hiprune_ratio,
-    get_hydart_lambdas,
     hiprune_pp_select,
     hiprune_select,
     hydart_select,
+    pack_hiprune_config,
+    unpack_hiprune_config,
+    HIPRUNE_MM_KWARG_KEYS,
+    HipruneConfig,
 )
 from vllm.multimodal.hiprune import (
     compute_hiprune_pp_budget as hiprune_pp_budget,
@@ -117,14 +121,25 @@ class LlavaImagePixelInputs(TensorSchema):
         TensorShape("bn"),
     ] = None
 
-    # HiPrune++ prompt token ids, one identical row per image (the mm
-    # field machinery is per-item), emitted by the processor only under
-    # HIPRUNE_METHOD=hiprune_pp. "pl" (prompt length) is dynamic because
-    # a batch can span requests with different prompts (rows then arrive
-    # as a list of unequal-length tensors).
+    # HiPrune++ / DART prompt token ids, one identical row per image (the
+    # mm field machinery is per-item), emitted by the processor whenever
+    # pruning is requested (an empty row for methods that don't use the
+    # prompt, keeping field presence uniform across a mixed-method
+    # batch). "pl" (prompt length) is dynamic because a batch can span
+    # requests with different prompts (rows then arrive as a list of
+    # unequal-length tensors).
     hiprune_prompt_ids: Annotated[
         torch.Tensor | list[torch.Tensor] | None,
         TensorShape("bn", "pl", dynamic_dims={"pl"}),
+    ] = None
+
+    # Packed per-image pruning config (method id + knobs; see
+    # pack_hiprune_config), emitted alongside hiprune_ratio so the model
+    # forward can dispatch the selection method per image — a batch may
+    # span requests with different methods.
+    hiprune_config: Annotated[
+        torch.Tensor | None,
+        TensorShape("bn", 6),
     ] = None
 
 
@@ -292,10 +307,10 @@ class LlavaDummyInputsBuilder(BaseDummyInputsBuilder[_I]):
 
 class LlavaProcessingInfo(BaseLlavaProcessingInfo):
     def get_hf_processor(self, **kwargs: object):
-        # hiprune_ratio / hiprune_prompt are vLLM-side kwargs (placeholder
-        # sizing + model selection); the HF processor does not know them.
-        kwargs.pop("hiprune_ratio", None)
-        kwargs.pop("hiprune_prompt", None)
+        # hiprune_* are vLLM-side kwargs (placeholder sizing + model
+        # selection); the HF processor does not know them.
+        for key in HIPRUNE_MM_KWARG_KEYS:
+            kwargs.pop(key, None)
         hf_processor = self.ctx.get_hf_processor(LlavaProcessor, **kwargs)
         # In case patch_size is omitted from `processor_config.json`
         # e.g. for E5-V: https://huggingface.co/royokong/e5-v
@@ -360,6 +375,7 @@ class LlavaMultiModalProcessor(BaseLlavaMultiModalProcessor[LlavaProcessingInfo]
             image_embeds=MultiModalFieldConfig.batched("image"),
             hiprune_ratio=MultiModalFieldConfig.batched("image"),
             hiprune_prompt_ids=MultiModalFieldConfig.batched("image"),
+            hiprune_config=MultiModalFieldConfig.batched("image"),
         )
 
     def _call_hf_processor(
@@ -379,39 +395,46 @@ class LlavaMultiModalProcessor(BaseLlavaMultiModalProcessor[LlavaProcessingInfo]
                     "be started with --enable-hiprune."
                 )
         # The HF processor does not know the vLLM-side kwargs.
+        hiprune_kwargs = mm_kwargs
         mm_kwargs = {
-            k: v
-            for k, v in mm_kwargs.items()
-            if k not in ("hiprune_ratio", "hiprune_prompt")
+            k: v for k, v in mm_kwargs.items() if k not in HIPRUNE_MM_KWARG_KEYS
         }
 
         processed_outputs = super()._call_hf_processor(
             prompt, mm_data, mm_kwargs, tok_kwargs
         )
 
-        # HiPrune: attach the retention ratio per image so it reaches the
-        # model at encode time (the ratio is per-request). The prompt
-        # placeholder count is reduced in _get_prompt_updates with the
-        # same count function the model uses at selection time.
+        # HiPrune: attach the retention ratio and packed method/knob
+        # config per image so they reach the model at encode time (they
+        # are per-request). The prompt placeholder count is reduced in
+        # _get_prompt_updates with the same count function the model
+        # uses at selection time.
         if hiprune_ratio is not None and "pixel_values" in processed_outputs:
             num_images = len(processed_outputs["pixel_values"])
             processed_outputs["hiprune_ratio"] = torch.full(
                 (num_images,), hiprune_ratio, dtype=torch.float32
             )
+            processed_outputs["hiprune_config"] = (
+                pack_hiprune_config(hiprune_kwargs)
+                .unsqueeze(0)
+                .repeat(num_images, 1)
+            )
             # HiPrune++ / DART: ship the prompt token ids to the model so
             # it can embed them (LM embedding table) for text-guided
-            # selection (HiPrune++) or text pivots (DART). One identical
-            # row per image — the mm field machinery is per-item.
-            if get_hiprune_method() in ("hiprune_pp", "dart"):
+            # selection (HiPrune++) or text pivots (DART). Always
+            # attached when pruning is requested — an empty row for
+            # methods that don't use the prompt — so field presence is
+            # uniform when a batch mixes methods across requests. One
+            # identical row per image — the mm field machinery is
+            # per-item.
+            ids: list[int] = []
+            if get_hiprune_method(hiprune_kwargs) in ("hiprune_pp", "dart"):
                 tokenizer = self.info.get_tokenizer()
-                ids = (
-                    tokenizer.encode(hiprune_prompt, add_special_tokens=False)
-                    if hiprune_prompt
-                    else []
-                )
-                processed_outputs["hiprune_prompt_ids"] = (
-                    torch.tensor([ids], dtype=torch.long).repeat(num_images, 1)
-                )
+                if hiprune_prompt:
+                    ids = tokenizer.encode(hiprune_prompt, add_special_tokens=False)
+            processed_outputs["hiprune_prompt_ids"] = torch.tensor(
+                [ids], dtype=torch.long
+            ).repeat(num_images, 1)
 
         return processed_outputs
 
@@ -445,15 +468,18 @@ class LlavaMultiModalProcessor(BaseLlavaMultiModalProcessor[LlavaProcessingInfo]
                 # of the base budget (additive, per the paper); the
                 # count never depends on the prompt content.
                 if hiprune_ratio is not None:
-                    method = get_hiprune_method()
+                    method = get_hiprune_method(hf_processor_mm_kwargs)
                     if method == "hiprune_pp":
                         base, t_sum = hiprune_pp_budget(
-                            num_image_tokens, hiprune_ratio
+                            num_image_tokens,
+                            hiprune_ratio,
+                            get_hiprune_pp_beta(hf_processor_mm_kwargs),
                         )
                         num_image_tokens = base + t_sum
                     elif method == "dart":
+                        p_img, p_txt = get_dart_pivots(hf_processor_mm_kwargs)
                         num_image_tokens = dart_keep_count(
-                            num_image_tokens, hiprune_ratio
+                            num_image_tokens, hiprune_ratio, p_img, p_txt
                         )
                     else:
                         num_image_tokens = hiprune_retained_tokens_count(
@@ -755,6 +781,7 @@ class LlavaForConditionalGeneration(
         image_embeds = kwargs.pop("image_embeds", None)
         hiprune_ratio = kwargs.pop("hiprune_ratio", None)
         hiprune_prompt_ids = kwargs.pop("hiprune_prompt_ids", None)
+        hiprune_config = kwargs.pop("hiprune_config", None)
 
         if pixel_values is None and image_embeds is None:
             return None
@@ -772,6 +799,7 @@ class LlavaForConditionalGeneration(
                 pixel_values=pixel_values,
                 hiprune_ratio=hiprune_ratio,
                 hiprune_prompt_ids=hiprune_prompt_ids,
+                hiprune_config=hiprune_config,
                 resolve_bindings={"h": expected_h, "w": expected_w},
             )
 
@@ -819,6 +847,7 @@ class LlavaForConditionalGeneration(
 
         ratios: list[float | None] = [None] * num_images
         prompt_ids: list[torch.Tensor | None] = [None] * num_images
+        configs: list[HipruneConfig | None] = [None] * num_images
         if image_input["type"] == "pixel_values":
             hp_field = image_input.get("hiprune_ratio")
             if hp_field is not None:
@@ -833,10 +862,17 @@ class LlavaForConditionalGeneration(
                     row = pid_field[idx]
                     if row.numel():
                         prompt_ids[idx] = row
+            # Packed method/knob config, kept per image: a batch can
+            # span requests with different methods.
+            cfg_field = image_input.get("hiprune_config")
+            for idx in range(num_images):
+                if ratios[idx] is not None:
+                    row = cfg_field[idx] if cfg_field is not None else None
+                    configs[idx] = unpack_hiprune_config(row)
 
         if any(r is not None for r in ratios):
             return self._process_image_input_hiprune(
-                image_input["pixel_values"], ratios, prompt_ids
+                image_input["pixel_values"], ratios, prompt_ids, configs
             )
 
         image_features = self._process_image_pixels(image_input)
@@ -855,6 +891,7 @@ class LlavaForConditionalGeneration(
         pixel_values: torch.Tensor,
         ratios: list[float | None],
         prompt_ids: list[torch.Tensor | None] | None = None,
+        configs: list[HipruneConfig | None] | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Encode images one at a time, pruning with HiPrune where requested.
 
@@ -911,11 +948,6 @@ class LlavaForConditionalGeneration(
         num_loaded_layers = len(tower.vision_model.encoder.layers)
         object_layer_idx = LLAVA_OBJECT_LAYER - 1
         deep_layer_idx = num_loaded_layers - 1
-        method = get_hiprune_method()
-        if method == "hydart":
-            capture_layer_idxs: tuple[int, ...] = (object_layer_idx,)
-        else:
-            capture_layer_idxs = (object_layer_idx, deep_layer_idx)
 
         # HiPrune++: per-image mean LM embedding of the prompt tokens.
         def _text_embedding_for(idx: int) -> torch.Tensor | None:
@@ -932,6 +964,16 @@ class LlavaForConditionalGeneration(
                 features = self._image_pixels_to_features(tower, pv)
                 image_embeds_out.append(self.multi_modal_projector(features)[0])
                 continue
+
+            # Per-image method dispatch: images are encoded individually
+            # anyway (see docstring), so a batch mixing methods across
+            # requests just takes a different branch per image.
+            cfg = (
+                configs[idx]
+                if configs is not None and configs[idx] is not None
+                else unpack_hiprune_config(None)
+            )
+            method = cfg.method
 
             if method == "dart":
                 features = self._image_pixels_to_features(tower, pv)
@@ -954,7 +996,7 @@ class LlavaForConditionalGeneration(
                 hidden, key_l1 = dart_prefix_states_llama(
                     lm.layers, lm.norm, seq_embeds, positions, dart_layer
                 )
-                p_img, p_txt = get_dart_pivots()
+                p_img, p_txt = cfg.pivot_image, cfg.pivot_text
                 img_piv, txt_piv, diverse_idx, kept_mask, pivot_sim = (
                     dart_select(hidden, key_l1, num_tokens, ratio, p_img, p_txt)
                 )
@@ -976,6 +1018,12 @@ class LlavaForConditionalGeneration(
                 self._hiprune_metadata[idx] = metadata
                 continue
 
+            # HyDART needs only the object-layer scores (its diverse fill
+            # uses embedding similarity, not deep attention).
+            if method == "hydart":
+                capture_layer_idxs: tuple[int, ...] = (object_layer_idx,)
+            else:
+                capture_layer_idxs = (object_layer_idx, deep_layer_idx)
             features, scores_by_layer = tower.forward_capturing_hiprune_scores(
                 pv,
                 capture_layer_idxs=capture_layer_idxs,
@@ -990,7 +1038,7 @@ class LlavaForConditionalGeneration(
             shallow = scores_by_layer[object_layer_idx][1:]
 
             if method == "hydart":
-                lambda_seed, lambda_pick = get_hydart_lambdas()
+                lambda_seed, lambda_pick = cfg.lambda_seed, cfg.lambda_pick
                 anchor_idx, buffer_idx, diverse_idx, kept_mask, sim_stats = (
                     hydart_select(
                         shallow,
@@ -1031,7 +1079,14 @@ class LlavaForConditionalGeneration(
                     kept_mask,
                     text_similarity,
                 ) = hiprune_pp_select(
-                    shallow, deep, embeds, text_emb, num_tokens, grid_w, ratio
+                    shallow,
+                    deep,
+                    embeds,
+                    text_emb,
+                    num_tokens,
+                    grid_w,
+                    ratio,
+                    beta=cfg.beta,
                 )
                 metadata = build_hiprune_pp_metadata(
                     anchor_idx,
@@ -1046,6 +1101,7 @@ class LlavaForConditionalGeneration(
                     grid_h,
                     ratio,
                     object_layer=LLAVA_OBJECT_LAYER,
+                    beta=cfg.beta,
                 )
             else:
                 deep = scores_by_layer[deep_layer_idx][1:]

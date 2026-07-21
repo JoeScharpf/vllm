@@ -22,11 +22,18 @@ from vllm.multimodal.hiprune import (
     get_dart_layer,
     get_dart_pivots,
     get_hiprune_method,
+    get_hiprune_pp_beta,
     get_hiprune_prompt,
     get_hiprune_ratio,
+    get_hydart_lambdas,
     hiprune_pp_select,
     hiprune_select,
     hydart_select,
+    pack_hiprune_config,
+    unpack_hiprune_config,
+    HIPRUNE_CONFIG_WIDTH,
+    HIPRUNE_METHOD_IDS,
+    HIPRUNE_MM_KWARG_KEYS,
 )
 
 POOL_K = 3
@@ -1314,3 +1321,134 @@ def test_get_dart_layer_env(monkeypatch):
     monkeypatch.setenv("HIPRUNE_DART_LAYER", "0")
     with pytest.raises(ValueError):
         get_dart_layer()
+
+
+# --------------------------------------------------------------------- #
+# Per-request method/knobs (mm kwargs over env) and the packed config
+# --------------------------------------------------------------------- #
+
+
+def test_get_hiprune_method_kwargs_precedence(monkeypatch):
+    monkeypatch.delenv("HIPRUNE_METHOD", raising=False)
+    assert get_hiprune_method({"hiprune_method": "dart"}) == "dart"
+    assert get_hiprune_method({"hiprune_method": "HyDART"}) == "hydart"
+    # kwargs without the key fall back to env.
+    monkeypatch.setenv("HIPRUNE_METHOD", "hiprune_pp")
+    assert get_hiprune_method({}) == "hiprune_pp"
+    # kwargs win over env.
+    assert get_hiprune_method({"hiprune_method": "hiprune"}) == "hiprune"
+    with pytest.raises(ValueError):
+        get_hiprune_method({"hiprune_method": "bogus"})
+
+
+def test_knob_accessors_kwargs_precedence(monkeypatch):
+    for var in (
+        "HYDART_LAMBDA_SEED",
+        "HYDART_LAMBDA_PICK",
+        "HIPRUNE_PP_BETA",
+        "HIPRUNE_DART_PIVOT_IMAGE",
+        "HIPRUNE_DART_PIVOT_TEXT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    assert get_hydart_lambdas({"hiprune_lambda_seed": 0.3}) == (0.3, 0.5)
+    assert get_hydart_lambdas({"hiprune_lambda_pick": 0.9}) == (0.1, 0.9)
+    assert get_hiprune_pp_beta({"hiprune_beta": 0.25}) == 0.25
+    assert get_dart_pivots(
+        {"hiprune_pivot_image": 2, "hiprune_pivot_text": 6}
+    ) == (2, 6)
+
+    # kwargs win over env.
+    monkeypatch.setenv("HYDART_LAMBDA_SEED", "0.7")
+    monkeypatch.setenv("HIPRUNE_PP_BETA", "0.4")
+    monkeypatch.setenv("HIPRUNE_DART_PIVOT_IMAGE", "8")
+    assert get_hydart_lambdas({"hiprune_lambda_seed": 0.2})[0] == 0.2
+    assert get_hydart_lambdas({})[0] == 0.7
+    assert get_hiprune_pp_beta({"hiprune_beta": 0.05}) == 0.05
+    assert get_dart_pivots({"hiprune_pivot_image": 3})[0] == 3
+    assert get_dart_pivots({})[0] == 8
+
+    with pytest.raises(ValueError):
+        get_hiprune_pp_beta({"hiprune_beta": 1.5})
+    with pytest.raises(ValueError):
+        get_dart_pivots({"hiprune_pivot_image": 0})
+
+
+def test_pack_unpack_hiprune_config_roundtrip(monkeypatch):
+    for var in (
+        "HIPRUNE_METHOD",
+        "HYDART_LAMBDA_SEED",
+        "HYDART_LAMBDA_PICK",
+        "HIPRUNE_PP_BETA",
+        "HIPRUNE_DART_PIVOT_IMAGE",
+        "HIPRUNE_DART_PIVOT_TEXT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    kwargs = {
+        "hiprune_method": "dart",
+        "hiprune_lambda_seed": 0.2,
+        "hiprune_lambda_pick": 0.7,
+        "hiprune_beta": 0.15,
+        "hiprune_pivot_image": 3,
+        "hiprune_pivot_text": 5,
+    }
+    row = pack_hiprune_config(kwargs)
+    assert row.shape == (HIPRUNE_CONFIG_WIDTH,)
+    assert row.dtype == torch.float32
+
+    cfg = unpack_hiprune_config(row)
+    assert cfg.method == "dart"
+    assert cfg.pivot_image == 3 and cfg.pivot_text == 5
+    assert cfg.lambda_seed == pytest.approx(0.2, abs=1e-6)
+    assert cfg.lambda_pick == pytest.approx(0.7, abs=1e-6)
+    assert cfg.beta == pytest.approx(0.15, abs=1e-6)
+
+    # Every method id round-trips.
+    for method in HIPRUNE_METHOD_IDS:
+        cfg = unpack_hiprune_config(pack_hiprune_config({"hiprune_method": method}))
+        assert cfg.method == method
+
+    with pytest.raises(ValueError):
+        unpack_hiprune_config(torch.zeros(3))
+    with pytest.raises(ValueError):
+        unpack_hiprune_config(
+            torch.tensor([99.0, 0.1, 0.5, 0.1, 4.0, 4.0], dtype=torch.float32)
+        )
+
+
+def test_unpack_none_falls_back_to_env(monkeypatch):
+    for var in (
+        "HYDART_LAMBDA_SEED",
+        "HYDART_LAMBDA_PICK",
+        "HIPRUNE_PP_BETA",
+        "HIPRUNE_DART_PIVOT_IMAGE",
+        "HIPRUNE_DART_PIVOT_TEXT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HIPRUNE_METHOD", "hydart")
+    monkeypatch.setenv("HYDART_LAMBDA_SEED", "0.33")
+
+    cfg = unpack_hiprune_config(None)
+    assert cfg.method == "hydart"
+    assert cfg.lambda_seed == pytest.approx(0.33, abs=1e-6)
+    assert cfg.pivot_image == 4 and cfg.pivot_text == 4
+
+    monkeypatch.delenv("HIPRUNE_METHOD", raising=False)
+    assert unpack_hiprune_config(None).method == "hiprune"
+
+
+def test_hiprune_mm_kwarg_keys_cover_pack_inputs():
+    # pack_hiprune_config reads exactly these per-request keys; the strip
+    # list model processors use must cover all of them (plus ratio and
+    # prompt) or the HF processor would receive vLLM-side kwargs.
+    assert set(HIPRUNE_MM_KWARG_KEYS) == {
+        "hiprune_ratio",
+        "hiprune_prompt",
+        "hiprune_method",
+        "hiprune_lambda_seed",
+        "hiprune_lambda_pick",
+        "hiprune_beta",
+        "hiprune_pivot_image",
+        "hiprune_pivot_text",
+    }
