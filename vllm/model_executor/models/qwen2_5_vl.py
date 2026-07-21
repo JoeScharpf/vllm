@@ -1641,13 +1641,29 @@ class Qwen2_5_VLForConditionalGeneration(
         llm_pos_ids_list: list = []
         st = 0
 
-        for (
+        # HiPrune: pruned placeholder runs are shrunk in the prompt, so
+        # each feature occupies mm_position.length tokens, not the full
+        # grid product. Advance by the actual run length and emit exactly
+        # that many position columns — otherwise the cursor overshoots and
+        # the next feature's text_len goes negative on multi-image
+        # requests. The per-column values for pruned runs are provisional;
+        # recompute_mrope_positions replaces them once the pruned
+        # embeddings (with their kept spatial positions) are available.
+        # Unpruned runs have length == grid product, so this is identical
+        # to the upstream behavior.
+        run_lengths = [
+            f.mm_position.length
+            for f in sorted(mm_features, key=lambda f: f.mm_position.offset)
+            if f.modality != "prompt_embeds"
+        ]
+
+        for run_length, (
             offset,
             llm_grid_t,
             llm_grid_h,
             llm_grid_w,
             t_factor,
-        ) in self.iter_mm_grid_thw(mm_features):
+        ) in zip(run_lengths, self.iter_mm_grid_thw(mm_features)):
             text_len = offset - st
             st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
             llm_pos_ids_list.append(
@@ -1657,8 +1673,9 @@ class Qwen2_5_VLForConditionalGeneration(
             grid_indices = np.indices((llm_grid_t, llm_grid_h, llm_grid_w))
             if t_factor != 1.0:
                 grid_indices[0] = (grid_indices[0] * t_factor).astype(np.int64)
-            llm_pos_ids_list.append(grid_indices.reshape(3, -1) + text_len + st_idx)
-            st = offset + llm_grid_t * llm_grid_h * llm_grid_w
+            grid_positions = grid_indices.reshape(3, -1)[:, :run_length]
+            llm_pos_ids_list.append(grid_positions + text_len + st_idx)
+            st = offset + run_length
 
         if st < len(input_tokens):
             st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
