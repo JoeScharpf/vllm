@@ -391,10 +391,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=None,
         description=(
             "Selection method for token_pruning: 'hiprune' (default), "
-            "'hydart', 'hiprune_pp' or 'dart'. Per-request — the same "
-            "running server can serve different methods. Shorthand for "
-            "mm_processor_kwargs={'hiprune_method': ...}. Omitted: the "
-            "server's HIPRUNE_METHOD env var (default 'hiprune')."
+            "'hydart', 'hiprune_pp', 'dart' or 'nprune'. Per-request — "
+            "the same running server can serve different methods. "
+            "Shorthand for mm_processor_kwargs={'hiprune_method': ...}. "
+            "Omitted: the server's HIPRUNE_METHOD env var (default "
+            "'hiprune')."
         ),
     )
     token_pruning_params: dict[str, float] | None = Field(
@@ -402,9 +403,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description=(
             "Per-request pruning knobs: lambda_seed / lambda_pick "
             "(HyDART), beta (HiPrune++), pivot_image / pivot_text "
-            "(DART). Unknown keys are rejected. Each maps onto the "
-            "corresponding hiprune_* mm-processor kwarg; omitted knobs "
-            "fall back to the server env / paper defaults."
+            "(DART), stride (NPrune). Unknown keys are rejected. Each "
+            "maps onto the corresponding hiprune_* mm-processor kwarg; "
+            "omitted knobs fall back to the server env / paper defaults."
         ),
     )
     structured_outputs: StructuredOutputsParams | None = Field(
@@ -1030,6 +1031,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "beta": "hiprune_beta",
                     "pivot_image": "hiprune_pivot_image",
                     "pivot_text": "hiprune_pivot_text",
+                    "stride": "hiprune_stride",
                 }
                 unknown = set(self.token_pruning_params) - set(param_to_mm_key)
                 if unknown:

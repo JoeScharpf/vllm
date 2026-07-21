@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from abc import abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Final, Literal, Protocol, TypeAlias, TypeVar
@@ -33,6 +34,7 @@ from vllm.multimodal.hiprune import (
     build_hiprune_metadata,
     build_hiprune_pp_metadata,
     build_hydart_metadata,
+    build_nprune_metadata,
     dart_keep_count,
     dart_select,
     get_dart_layer,
@@ -41,9 +43,12 @@ from vllm.multimodal.hiprune import (
     get_hiprune_pp_beta,
     get_hiprune_prompt,
     get_hiprune_ratio,
+    get_nprune_stride,
     hiprune_pp_select,
     hiprune_select,
     hydart_select,
+    nprune_keep_count,
+    nprune_select,
     pack_hiprune_config,
     unpack_hiprune_config,
     HIPRUNE_MM_KWARG_KEYS,
@@ -139,7 +144,7 @@ class LlavaImagePixelInputs(TensorSchema):
     # span requests with different methods.
     hiprune_config: Annotated[
         torch.Tensor | None,
-        TensorShape("bn", 6),
+        TensorShape("bn", 7),
     ] = None
 
 
@@ -480,6 +485,16 @@ class LlavaMultiModalProcessor(BaseLlavaMultiModalProcessor[LlavaProcessingInfo]
                         p_img, p_txt = get_dart_pivots(hf_processor_mm_kwargs)
                         num_image_tokens = dart_keep_count(
                             num_image_tokens, hiprune_ratio, p_img, p_txt
+                        )
+                    elif method == "nprune":
+                        # Grid-shape-aware count (exact lattice). LLaVA's
+                        # patch grid is square (24x24 for 336px CLIP).
+                        side = math.isqrt(num_image_tokens)
+                        assert side * side == num_image_tokens
+                        num_image_tokens = nprune_keep_count(
+                            side,
+                            side,
+                            get_nprune_stride(hf_processor_mm_kwargs),
                         )
                     else:
                         num_image_tokens = hiprune_retained_tokens_count(
@@ -974,6 +989,22 @@ class LlavaForConditionalGeneration(
                 else unpack_hiprune_config(None)
             )
             method = cfg.method
+
+            # NPrune: pure uniform-lattice sampling — no attention
+            # capture, no scores, no prompt. Plain tower forward.
+            if method == "nprune":
+                features = self._image_pixels_to_features(tower, pv)
+                embeds = self.multi_modal_projector(features)[0]
+                assert embeds.shape[0] == num_tokens
+                kept_idx, kept_mask = nprune_select(
+                    grid_h, grid_w, cfg.stride, device=embeds.device
+                )
+                metadata = build_nprune_metadata(
+                    kept_idx, kept_mask, grid_w, grid_h, cfg.stride
+                )
+                image_embeds_out.append(embeds[kept_mask])
+                self._hiprune_metadata[idx] = metadata
+                continue
 
             if method == "dart":
                 features = self._image_pixels_to_features(tower, pv)

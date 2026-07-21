@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for HiPrune visual token selection (vllm/multimodal/hiprune.py)."""
 
+import math
+
 import pytest
 import torch
 
@@ -26,9 +28,13 @@ from vllm.multimodal.hiprune import (
     get_hiprune_prompt,
     get_hiprune_ratio,
     get_hydart_lambdas,
+    get_nprune_stride,
     hiprune_pp_select,
     hiprune_select,
     hydart_select,
+    nprune_keep_count,
+    nprune_select,
+    build_nprune_metadata,
     pack_hiprune_config,
     unpack_hiprune_config,
     HIPRUNE_CONFIG_WIDTH,
@@ -828,6 +834,8 @@ def test_get_hiprune_method_env(monkeypatch):
     assert get_hiprune_method() == "hiprune_pp"
     monkeypatch.setenv("HIPRUNE_METHOD", "dart")
     assert get_hiprune_method() == "dart"
+    monkeypatch.setenv("HIPRUNE_METHOD", "nprune")
+    assert get_hiprune_method() == "nprune"
     monkeypatch.setenv("HIPRUNE_METHOD", "bogus")
     with pytest.raises(ValueError):
         get_hiprune_method()
@@ -1392,6 +1400,7 @@ def test_pack_unpack_hiprune_config_roundtrip(monkeypatch):
         "hiprune_beta": 0.15,
         "hiprune_pivot_image": 3,
         "hiprune_pivot_text": 5,
+        "hiprune_stride": 1,
     }
     row = pack_hiprune_config(kwargs)
     assert row.shape == (HIPRUNE_CONFIG_WIDTH,)
@@ -1403,6 +1412,7 @@ def test_pack_unpack_hiprune_config_roundtrip(monkeypatch):
     assert cfg.lambda_seed == pytest.approx(0.2, abs=1e-6)
     assert cfg.lambda_pick == pytest.approx(0.7, abs=1e-6)
     assert cfg.beta == pytest.approx(0.15, abs=1e-6)
+    assert cfg.stride == 1
 
     # Every method id round-trips.
     for method in HIPRUNE_METHOD_IDS:
@@ -1412,8 +1422,15 @@ def test_pack_unpack_hiprune_config_roundtrip(monkeypatch):
     with pytest.raises(ValueError):
         unpack_hiprune_config(torch.zeros(3))
     with pytest.raises(ValueError):
+        # Old 6-wide rows (pre-stride) are rejected loudly, not
+        # silently defaulted — matters if processor and model worker
+        # briefly run different commits during a deploy.
         unpack_hiprune_config(
-            torch.tensor([99.0, 0.1, 0.5, 0.1, 4.0, 4.0], dtype=torch.float32)
+            torch.tensor([0.0, 0.1, 0.5, 0.1, 4.0, 4.0], dtype=torch.float32)
+        )
+    with pytest.raises(ValueError):
+        unpack_hiprune_config(
+            torch.tensor([99.0, 0.1, 0.5, 0.1, 4.0, 4.0, 2.0], dtype=torch.float32)
         )
 
 
@@ -1451,4 +1468,121 @@ def test_hiprune_mm_kwarg_keys_cover_pack_inputs():
         "hiprune_beta",
         "hiprune_pivot_image",
         "hiprune_pivot_text",
+        "hiprune_stride",
     }
+
+
+# --------------------------------------------------------------------------
+# NPrune (naive uniform spatial pruning)
+# --------------------------------------------------------------------------
+
+
+def test_nprune_even_grid_exact_lattice():
+    """On even grids stride 2 keeps exactly the upper-left corner of
+    every 2x2 block — 25% retention, row-major indices."""
+    grid_h, grid_w = 4, 6
+    kept_idx, kept_mask = nprune_select(grid_h, grid_w, 2)
+
+    expected = [
+        r * grid_w + c
+        for r in range(0, grid_h, 2)
+        for c in range(0, grid_w, 2)
+    ]
+    assert kept_idx.tolist() == expected
+    assert int(kept_mask.sum()) == len(expected) == grid_h * grid_w // 4
+    assert kept_mask.shape[0] == grid_h * grid_w
+    assert kept_mask[kept_idx].all()
+
+
+@pytest.mark.parametrize(
+    "grid_h,grid_w",
+    [(1, 1), (1, 2), (2, 1), (2, 2), (3, 3), (3, 5), (24, 24), (23, 31), (34, 46)],
+)
+@pytest.mark.parametrize("stride", [1, 2])
+def test_nprune_count_invariant(grid_h: int, grid_w: int, stride: int):
+    """kept_mask.sum() == nprune_keep_count for every grid — the
+    processor/model placeholder invariant."""
+    kept_idx, kept_mask = nprune_select(grid_h, grid_w, stride)
+    expected = nprune_keep_count(grid_h, grid_w, stride)
+    assert int(kept_mask.sum()) == kept_idx.numel() == expected
+    # Exact ceil form, not ceil(N / stride^2).
+    assert expected == math.ceil(grid_h / stride) * math.ceil(grid_w / stride)
+    # Ascending, unique, in-range raster indices.
+    assert (kept_idx[1:] > kept_idx[:-1]).all() if kept_idx.numel() > 1 else True
+    assert kept_idx.min() >= 0 and kept_idx.max() < grid_h * grid_w
+    # Every kept index sits on the lattice.
+    rows = kept_idx // grid_w
+    cols = kept_idx % grid_w
+    assert (rows % stride == 0).all() and (cols % stride == 0).all()
+
+
+def test_nprune_odd_grid_exact_not_ratio_derived():
+    """3x3 at stride 2 keeps the 4 corners (44.4%), not ceil(9/4) = 3."""
+    kept_idx, kept_mask = nprune_select(3, 3, 2)
+    assert kept_idx.tolist() == [0, 2, 6, 8]
+    assert nprune_keep_count(3, 3, 2) == 4
+
+
+def test_nprune_stride_one_identity():
+    """Stride 1 keeps every token (serving maps it to no-pruning; the
+    selection itself must still be the identity)."""
+    kept_idx, kept_mask = nprune_select(5, 7, 1)
+    assert kept_mask.all()
+    assert kept_idx.tolist() == list(range(35))
+    assert nprune_keep_count(5, 7, 1) == 35
+
+
+def test_nprune_deterministic():
+    a_idx, a_mask = nprune_select(17, 29, 2)
+    b_idx, b_mask = nprune_select(17, 29, 2)
+    assert torch.equal(a_idx, b_idx) and torch.equal(a_mask, b_mask)
+
+
+def test_nprune_gemma_grid_parity():
+    """Grid dims from real Gemma pixel_position_ids feed the same count
+    the selection produces (the processor/model parity path)."""
+    for patch_w, patch_h in [(12, 9), (45, 39), (15, 51)]:
+        pos = _make_position_ids(patch_w, patch_h)
+        _, grid_w, grid_h, _ = compute_soft_token_grid(pos, POOL_K)
+        kept_idx, kept_mask = nprune_select(grid_h, grid_w, 2)
+        assert int(kept_mask.sum()) == nprune_keep_count(grid_h, grid_w, 2)
+        assert kept_mask.shape[0] == grid_w * grid_h
+
+
+def test_nprune_metadata_contents():
+    grid_h, grid_w = 4, 6
+    kept_idx, kept_mask = nprune_select(grid_h, grid_w, 2)
+    md = build_nprune_metadata(kept_idx, kept_mask, grid_w, grid_h, 2)
+
+    assert md["method"] == "nprune"
+    assert md["grid"] == [grid_w, grid_h]
+    assert md["num_tokens"] == grid_h * grid_w
+    assert md["stride"] == 2
+    # Actual retention (kept / num_tokens), exactly 0.25 on even grids.
+    assert md["retention"] == pytest.approx(0.25)
+    assert sorted(md["uniform"] + md["pruned"]) == list(range(grid_h * grid_w))
+    assert set(md["uniform"]).isdisjoint(md["pruned"])
+    # JSON-safe: plain ints/floats/lists only.
+    import json
+
+    json.dumps(md)
+
+    # Odd grid: retention reports the actual kept fraction.
+    kept_idx, kept_mask = nprune_select(3, 3, 2)
+    md = build_nprune_metadata(kept_idx, kept_mask, 3, 3, 2)
+    assert md["retention"] == pytest.approx(4 / 9)
+
+
+def test_get_nprune_stride(monkeypatch):
+    monkeypatch.delenv("HIPRUNE_NPRUNE_STRIDE", raising=False)
+    assert get_nprune_stride() == 2
+    assert get_nprune_stride({"hiprune_stride": 1}) == 1
+    assert get_nprune_stride({"hiprune_stride": 2.0}) == 2
+    # kwargs win over env.
+    monkeypatch.setenv("HIPRUNE_NPRUNE_STRIDE", "1")
+    assert get_nprune_stride() == 1
+    assert get_nprune_stride({"hiprune_stride": 2}) == 2
+    with pytest.raises(ValueError):
+        get_nprune_stride({"hiprune_stride": 3})
+    with pytest.raises(ValueError):
+        get_nprune_stride({"hiprune_stride": 0})
