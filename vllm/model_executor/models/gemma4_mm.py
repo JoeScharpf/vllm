@@ -49,10 +49,13 @@ from vllm.multimodal.hiprune import (
     GEMMA4_OBJECT_LAYER,
     aggregate_patch_attention,
     build_dart_metadata,
+    build_checkered_metadata,
     build_hiprune_metadata,
     build_hiprune_pp_metadata,
     build_hydart_metadata,
     build_nprune_metadata,
+    checkered_keep_count,
+    checkered_select,
     compute_hiprune_pp_budget,
     compute_retained_tokens_count,
     compute_soft_token_grid,
@@ -161,6 +164,11 @@ def _hiprune_keep_count(
     if method == "dart":
         p_img, p_txt = get_dart_pivots(hiprune_kwargs)
         return dart_keep_count(num_soft, hiprune_ratio, p_img, p_txt)
+    if method == "checkered":
+        # Exact ceil(N/2), shape-independent — NOT the ratio path
+        # (round(n*0.5) rounds half-to-even and loses a token on odd
+        # counts). Unlike nprune, no grid derivation is needed here.
+        return checkered_keep_count(num_soft)
     return compute_retained_tokens_count(num_soft, hiprune_ratio)
 
 
@@ -1724,10 +1732,11 @@ class Gemma4ForConditionalGeneration(
                     if ratios[chunk_items[0][0]] is not None
                     else None
                 )
-                # NPrune needs no attention either: its selection is a
-                # deterministic lattice over the soft-token grid.
+                # NPrune and Checkered need no attention either: their
+                # selections are deterministic patterns over the
+                # soft-token grid.
                 chunk_needs_pruning = pruned_cfg is not None and (
-                    pruned_cfg.method not in ("dart", "nprune")
+                    pruned_cfg.method not in ("dart", "nprune", "checkered")
                 )
                 if chunk_needs_pruning:
                     if pruned_cfg.method == "hydart":
@@ -1909,6 +1918,28 @@ class Gemma4ForConditionalGeneration(
                 valid_states = valid_states[kept_mask]
                 hiprune_metadata[orig_idx] = build_nprune_metadata(
                     kept_idx, kept_mask, grid_w, grid_h, cfg.stride
+                )
+            elif ratio is not None and method == "checkered":
+                # Checkered: deterministic checkerboard — no attention,
+                # no LM-space projection, no prompt. Prunes valid_states
+                # directly, the same soft-token sequence the other
+                # methods prune. The grid is only needed for the 2D
+                # pattern; the count is ceil(N/2) regardless of shape,
+                # matching the processor's count-only placeholder path.
+                _, grid_w, grid_h, _ = compute_soft_token_grid(
+                    pixel_position_ids[orig_idx], pooling_k
+                )
+                num_soft = valid_states.shape[0]
+                assert grid_w * grid_h == num_soft, (
+                    f"soft-token grid {grid_w}x{grid_h} != pooled "
+                    f"soft-token count {num_soft}"
+                )
+                kept_idx, kept_mask = checkered_select(
+                    grid_h, grid_w, device=valid_states.device
+                )
+                valid_states = valid_states[kept_mask]
+                hiprune_metadata[orig_idx] = build_checkered_metadata(
+                    kept_idx, kept_mask, grid_w, grid_h
                 )
             elif ratio is not None:
                 shallow, deep, grid_w, grid_h = hiprune_scores_map[orig_idx]

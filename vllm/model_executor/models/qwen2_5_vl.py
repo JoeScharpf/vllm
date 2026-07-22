@@ -80,10 +80,13 @@ from vllm.multimodal.dart_scoring import (
 from vllm.multimodal.hiprune import (
     QWEN2_5_VL_OBJECT_LAYER,
     build_dart_metadata,
+    build_checkered_metadata,
     build_hiprune_metadata,
     build_hydart_metadata,
     build_hiprune_pp_metadata,
     build_nprune_metadata,
+    checkered_keep_count,
+    checkered_select,
     dart_keep_count,
     dart_select,
     fold_merged_token_scores,
@@ -1541,6 +1544,11 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
                         W // ms,
                         get_nprune_stride(hf_processor_mm_kwargs),
                     )
+                elif method == "checkered":
+                    # Exact ceil(N/2), shape-independent — NOT the
+                    # ratio path (round(n*0.5) rounds half-to-even and
+                    # loses a token on odd counts).
+                    num_tokens = checkered_keep_count(num_tokens)
                 else:
                     num_tokens = hiprune_retained_tokens_count(
                         num_tokens, hiprune_ratio
@@ -1964,6 +1972,29 @@ class Qwen2_5_VLForConditionalGeneration(
                 )
                 metadata = build_nprune_metadata(
                     kept_idx, kept_mask, grid_w, grid_h, cfg.stride
+                )
+                image_embeds_out.append(embeds[kept_mask])
+                self._hiprune_kept_masks[idx] = kept_mask
+                self._hiprune_metadata[idx] = metadata
+                continue
+
+            # Checkered: deterministic checkerboard — no attention
+            # capture, no scores, no prompt. Plain visual forward.
+            if method == "checkered":
+                embeds = self.visual(pv, grid_thw=[thw])
+                t, h, w = thw
+                grid_h = h // merge_size
+                grid_w = w // merge_size
+                num_tokens = t * grid_h * grid_w
+                assert embeds.shape[0] == num_tokens
+                # Frames stack vertically in raster order, so the
+                # checkerboard runs over t*grid_h rows (t is 1 for
+                # images).
+                kept_idx, kept_mask = checkered_select(
+                    t * grid_h, grid_w, device=embeds.device
+                )
+                metadata = build_checkered_metadata(
+                    kept_idx, kept_mask, grid_w, grid_h
                 )
                 image_embeds_out.append(embeds[kept_mask])
                 self._hiprune_kept_masks[idx] = kept_mask

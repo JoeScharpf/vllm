@@ -35,6 +35,9 @@ from vllm.multimodal.hiprune import (
     nprune_keep_count,
     nprune_select,
     build_nprune_metadata,
+    checkered_keep_count,
+    checkered_select,
+    build_checkered_metadata,
     pack_hiprune_config,
     unpack_hiprune_config,
     HIPRUNE_CONFIG_WIDTH,
@@ -1586,3 +1589,139 @@ def test_get_nprune_stride(monkeypatch):
         get_nprune_stride({"hiprune_stride": 3})
     with pytest.raises(ValueError):
         get_nprune_stride({"hiprune_stride": 0})
+
+
+def _checkered_expected(grid_h: int, grid_w: int) -> list[int]:
+    """Independent reference: raster indices with (row + col) even."""
+    return [
+        r * grid_w + c
+        for r in range(grid_h)
+        for c in range(grid_w)
+        if (r + c) % 2 == 0
+    ]
+
+
+def test_checkered_4x4_exact_pattern():
+    """X.X. / .X.X / X.X. / .X.X — alternating on every row."""
+    kept_idx, kept_mask = checkered_select(4, 4)
+    assert kept_idx.tolist() == [0, 2, 5, 7, 8, 10, 13, 15]
+    assert int(kept_mask.sum()) == 8
+
+
+def test_checkered_3x3_exact_pattern():
+    """X.X / .X. / X.X — 5 of 9 kept (the (0,0) phase gets the extra)."""
+    kept_idx, kept_mask = checkered_select(3, 3)
+    assert kept_idx.tolist() == [0, 2, 4, 6, 8]
+    assert checkered_keep_count(9) == 5
+
+
+def test_checkered_3x5_exact_pattern():
+    """X.X.X / .X.X. / X.X.X — non-square odd grid."""
+    kept_idx, kept_mask = checkered_select(3, 5)
+    assert kept_idx.tolist() == [0, 2, 4, 6, 8, 10, 12, 14]
+    assert checkered_keep_count(15) == 8
+
+
+@pytest.mark.parametrize(
+    "grid_h,grid_w",
+    [(1, 1), (1, 2), (2, 1), (2, 2), (3, 3), (3, 5), (17, 16), (24, 24), (23, 31)],
+)
+def test_checkered_count_invariant(grid_h: int, grid_w: int):
+    """kept == ceil(HW/2) — the processor/model placeholder invariant —
+    and every kept cell satisfies (row + col) % 2 == 0."""
+    kept_idx, kept_mask = checkered_select(grid_h, grid_w)
+    n = grid_h * grid_w
+    expected = checkered_keep_count(n)
+    assert int(kept_mask.sum()) == kept_idx.numel() == expected == (n + 1) // 2
+    assert kept_idx.tolist() == _checkered_expected(grid_h, grid_w)
+    # Ascending, unique, in-range raster indices.
+    assert (kept_idx[1:] > kept_idx[:-1]).all() if kept_idx.numel() > 1 else True
+    rows = kept_idx // grid_w
+    cols = kept_idx % grid_w
+    assert ((rows + cols) % 2 == 0).all()
+    # A checkerboard keeps at least one token on EVERY row (what
+    # distinguishes it from a stride lattice, which skips rows) —
+    # except on single-column grids, where odd rows have only the
+    # odd-parity cell and correctly keep nothing.
+    if grid_w >= 2:
+        assert set(rows.tolist()) == set(range(grid_h))
+    else:
+        assert set(rows.tolist()) == set(range(0, grid_h, 2))
+
+
+def test_checkered_count_is_shape_independent():
+    """ceil(HW/2) depends only on the product — the property that lets
+    every placeholder-sizing site use the count-only path."""
+    for shapes in [[(2, 12), (3, 8), (4, 6), (24, 1)], [(3, 5), (5, 3), (15, 1)]]:
+        counts = set()
+        for grid_h, grid_w in shapes:
+            _, kept_mask = checkered_select(grid_h, grid_w)
+            counts.add(int(kept_mask.sum()))
+        assert len(counts) == 1
+
+
+def test_checkered_ratio_path_would_be_wrong():
+    """The generic budget round(n * 0.5) rounds half-to-even and loses
+    a token on odd counts — 9 tokens: ratio path 4, checkerboard 5.
+    Documents why every sizing site needs the explicit branch."""
+    assert compute_retained_tokens_count(9, 0.5) == 4
+    assert checkered_keep_count(9) == 5
+
+
+def test_checkered_deterministic():
+    a_idx, a_mask = checkered_select(17, 29)
+    b_idx, b_mask = checkered_select(17, 29)
+    assert torch.equal(a_idx, b_idx) and torch.equal(a_mask, b_mask)
+
+
+def test_checkered_invalid_grid_raises():
+    with pytest.raises(ValueError):
+        checkered_select(0, 5)
+    with pytest.raises(ValueError):
+        checkered_select(5, -1)
+
+
+def test_checkered_gemma_grid_parity():
+    """Grid dims from real Gemma pixel_position_ids feed the same count
+    the selection produces (the processor/model parity path)."""
+    for patch_w, patch_h in [(12, 9), (45, 39), (15, 51)]:
+        pos = _make_position_ids(patch_w, patch_h)
+        _, grid_w, grid_h, _ = compute_soft_token_grid(pos, POOL_K)
+        kept_idx, kept_mask = checkered_select(grid_h, grid_w)
+        assert int(kept_mask.sum()) == checkered_keep_count(grid_w * grid_h)
+        assert kept_mask.shape[0] == grid_w * grid_h
+
+
+def test_checkered_metadata_contents():
+    grid_h, grid_w = 17, 16
+    kept_idx, kept_mask = checkered_select(grid_h, grid_w)
+    md = build_checkered_metadata(kept_idx, kept_mask, grid_w, grid_h)
+
+    assert md["method"] == "checkered"
+    assert md["grid"] == [grid_w, grid_h]
+    assert md["num_tokens"] == 272
+    assert len(md["uniform"]) == 136 and len(md["pruned"]) == 136
+    # Actual retention, exactly 0.5 on even token counts.
+    assert md["retention"] == pytest.approx(0.5)
+    assert sorted(md["uniform"] + md["pruned"]) == list(range(272))
+    assert set(md["uniform"]).isdisjoint(md["pruned"])
+    # JSON-safe: plain ints/floats/lists only.
+    import json
+
+    json.dumps(md)
+
+    # Odd token count: retention reports the actual kept fraction.
+    kept_idx, kept_mask = checkered_select(3, 3)
+    md = build_checkered_metadata(kept_idx, kept_mask, 3, 3)
+    assert md["retention"] == pytest.approx(5 / 9)
+
+
+def test_checkered_method_registration(monkeypatch):
+    assert HIPRUNE_METHOD_IDS["checkered"] == 5
+    assert get_hiprune_method({"hiprune_method": "checkered"}) == "checkered"
+    monkeypatch.setenv("HIPRUNE_METHOD", "checkered")
+    assert get_hiprune_method() == "checkered"
+    # No knobs: the packed config row keeps its width.
+    row = pack_hiprune_config({"hiprune_method": "checkered"})
+    assert row.numel() == HIPRUNE_CONFIG_WIDTH
+    assert unpack_hiprune_config(row).method == "checkered"

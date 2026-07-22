@@ -121,16 +121,24 @@ def get_hiprune_method(merged_kwargs: Mapping[str, object] | None = None) -> str
     (attached by the API layer from the ``token_pruning_method`` chat
     field), falling back to the ``HIPRUNE_METHOD`` env var so
     env-configured servers and scripts keep working. One of ``hiprune``
-    (default), ``hydart``, ``hiprune_pp``, ``dart`` or ``nprune``.
+    (default), ``hydart``, ``hiprune_pp``, ``dart``, ``nprune`` or
+    ``checkered``.
     """
     val = merged_kwargs.get("hiprune_method") if merged_kwargs else None
     if val is None:
         val = os.environ.get("HIPRUNE_METHOD", "hiprune")
     method = str(val).lower()
-    if method not in ("hiprune", "hydart", "hiprune_pp", "dart", "nprune"):
+    if method not in (
+        "hiprune",
+        "hydart",
+        "hiprune_pp",
+        "dart",
+        "nprune",
+        "checkered",
+    ):
         raise ValueError(
             "hiprune method must be 'hiprune', 'hydart', 'hiprune_pp', "
-            f"'dart' or 'nprune', got {method!r}"
+            f"'dart', 'nprune' or 'checkered', got {method!r}"
         )
     return method
 
@@ -246,6 +254,7 @@ HIPRUNE_METHOD_IDS: dict[str, int] = {
     "hiprune_pp": 2,
     "dart": 3,
     "nprune": 4,
+    "checkered": 5,
 }
 _HIPRUNE_ID_METHODS = {v: k for k, v in HIPRUNE_METHOD_IDS.items()}
 
@@ -457,6 +466,62 @@ def nprune_select(
     kept_mask = torch.zeros(grid_h * grid_w, dtype=torch.bool, device=device)
     kept_mask[kept_idx] = True
     assert int(kept_mask.sum()) == nprune_keep_count(grid_h, grid_w, stride)
+    return kept_idx, kept_mask
+
+
+def checkered_keep_count(num_tokens: int) -> int:
+    """Number of soft tokens Checkered keeps: ``ceil(num_tokens / 2)``.
+
+    Shape-independent: on any ``H x W`` grid the cells with
+    ``(row + col) % 2 == 0`` number exactly ``ceil(H*W / 2)`` — when
+    ``W`` is even every row keeps ``W/2``; when ``W`` is odd the rows
+    alternate ``ceil(W/2)`` / ``floor(W/2)`` and the sum telescopes to
+    the same ceiling. Placeholder-sizing sites therefore need only the
+    token count, never the grid shape (unlike nprune). Called by both
+    the multimodal processor and :func:`checkered_select`, so the two
+    can never disagree.
+
+    Note the exactness matters: a ratio-derived ``round(n * 0.5)``
+    rounds half-to-even (9 tokens -> 4), while the checkerboard keeps
+    5 of 9 — one token of placeholder/embedding mismatch.
+    """
+    return (num_tokens + 1) // 2
+
+
+def checkered_select(
+    grid_h: int,
+    grid_w: int,
+    device: torch.device | str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Checkered: deterministic checkerboard pruning (content- and
+    prompt-free).
+
+    Keeps the cells where ``(row + col) % 2 == 0`` — the phase
+    containing the upper-left corner — over the raster-order soft-token
+    grid (kept indices ``i = r * grid_w + c``). Roughly 50% retention
+    (exactly 50% when ``grid_h * grid_w`` is even), with a kept token on
+    every row and the kept columns shifting by one on alternating rows.
+    No attention, no similarity, no scores.
+
+    Args:
+        grid_h / grid_w: soft-token grid shape (raster order, row-major).
+        device: device for the returned tensors.
+
+    Returns:
+        ``(kept_idx, kept_mask)`` over ``grid_h * grid_w`` raster-order
+        soft tokens; ``kept_idx`` is ascending. ``kept_mask.sum()``
+        equals :func:`checkered_keep_count` by construction (asserted).
+    """
+    if grid_h <= 0 or grid_w <= 0:
+        raise ValueError(
+            f"grid dims must be positive, got {grid_h}x{grid_w}"
+        )
+    rows = torch.arange(grid_h, device=device)
+    cols = torch.arange(grid_w, device=device)
+    row_grid, col_grid = torch.meshgrid(rows, cols, indexing="ij")
+    kept_mask = (((row_grid + col_grid) % 2) == 0).reshape(-1)
+    kept_idx = kept_mask.nonzero(as_tuple=True)[0]
+    assert int(kept_mask.sum()) == checkered_keep_count(grid_h * grid_w)
     return kept_idx, kept_mask
 
 
@@ -1312,6 +1377,32 @@ def build_nprune_metadata(
         "num_tokens": num_tokens,
         "retention": int(kept_idx.numel()) / num_tokens,
         "stride": stride,
+        "pruned": pruned_idx.tolist(),
+        "uniform": kept_idx.tolist(),
+    }
+
+
+def build_checkered_metadata(
+    kept_idx: torch.Tensor,
+    kept_mask: torch.Tensor,
+    grid_w: int,
+    grid_h: int,
+) -> dict[str, object]:
+    """JSON-safe per-image Checkered metadata for API reporting.
+
+    Checkered has no scores of any kind (no attention, no similarity),
+    so the metadata is just the checkerboard index sets. ``retention``
+    is the *actual* kept fraction (``ceil(HW/2) / HW``), which on
+    odd-token grids is slightly above the nominal 0.5 (e.g. 5/9 on a
+    3x3 grid).
+    """
+    num_tokens = int(kept_mask.shape[0])
+    pruned_idx = (~kept_mask).nonzero(as_tuple=True)[0]
+    return {
+        "method": "checkered",
+        "grid": [grid_w, grid_h],
+        "num_tokens": num_tokens,
+        "retention": int(kept_idx.numel()) / num_tokens,
         "pruned": pruned_idx.tolist(),
         "uniform": kept_idx.tolist(),
     }

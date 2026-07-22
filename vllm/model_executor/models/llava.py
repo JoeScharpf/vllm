@@ -31,10 +31,13 @@ from vllm.multimodal.dart_scoring import dart_prefix_states_llama
 from vllm.multimodal.hiprune import (
     LLAVA_OBJECT_LAYER,
     build_dart_metadata,
+    build_checkered_metadata,
     build_hiprune_metadata,
     build_hiprune_pp_metadata,
     build_hydart_metadata,
     build_nprune_metadata,
+    checkered_keep_count,
+    checkered_select,
     dart_keep_count,
     dart_select,
     get_dart_layer,
@@ -495,6 +498,12 @@ class LlavaMultiModalProcessor(BaseLlavaMultiModalProcessor[LlavaProcessingInfo]
                             side,
                             side,
                             get_nprune_stride(hf_processor_mm_kwargs),
+                        )
+                    elif method == "checkered":
+                        # Exact ceil(N/2), shape-independent — NOT the
+                        # ratio path (round(n*0.5) rounds half-to-even).
+                        num_image_tokens = checkered_keep_count(
+                            num_image_tokens
                         )
                     else:
                         num_image_tokens = hiprune_retained_tokens_count(
@@ -1001,6 +1010,22 @@ class LlavaForConditionalGeneration(
                 )
                 metadata = build_nprune_metadata(
                     kept_idx, kept_mask, grid_w, grid_h, cfg.stride
+                )
+                image_embeds_out.append(embeds[kept_mask])
+                self._hiprune_metadata[idx] = metadata
+                continue
+
+            # Checkered: deterministic checkerboard — no attention
+            # capture, no scores, no prompt. Plain tower forward.
+            if method == "checkered":
+                features = self._image_pixels_to_features(tower, pv)
+                embeds = self.multi_modal_projector(features)[0]
+                assert embeds.shape[0] == num_tokens
+                kept_idx, kept_mask = checkered_select(
+                    grid_h, grid_w, device=embeds.device
+                )
+                metadata = build_checkered_metadata(
+                    kept_idx, kept_mask, grid_w, grid_h
                 )
                 image_embeds_out.append(embeds[kept_mask])
                 self._hiprune_metadata[idx] = metadata
