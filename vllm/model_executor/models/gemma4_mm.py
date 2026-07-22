@@ -47,7 +47,11 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.dart_scoring import dart_prefix_states_gemma
 from vllm.multimodal.hiprune import (
     GEMMA4_OBJECT_LAYER,
+    HIPRUNE_CONFIG_WIDTH,
     aggregate_patch_attention,
+    anchorprune_resolve_kmin,
+    anchorprune_select,
+    build_anchorprune_metadata,
     build_dart_metadata,
     build_checkered_metadata,
     build_hiprune_metadata,
@@ -289,7 +293,7 @@ class Gemma4ImagePixelInputs(TensorSchema):
     # span requests with different methods.
     hiprune_config: Annotated[
         torch.Tensor | list[torch.Tensor] | None,
-        TensorShape("bn", 7),
+        TensorShape("bn", HIPRUNE_CONFIG_WIDTH),
     ] = None
 
 
@@ -986,7 +990,11 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
             # identical row per image — the mm field machinery is
             # per-item.
             ids: list[int] = []
-            if get_hiprune_method(merged_kwargs) in ("hiprune_pp", "dart"):
+            if get_hiprune_method(merged_kwargs) in (
+                "hiprune_pp",
+                "dart",
+                "anchorprune",
+            ):
                 hiprune_prompt = _get_hiprune_prompt(merged_kwargs)
                 if hiprune_prompt:
                     tokenizer = self.info.get_tokenizer()
@@ -1743,6 +1751,12 @@ class Gemma4ForConditionalGeneration(
                         capture_layer_idxs: tuple[int, ...] = (
                             GEMMA4_OBJECT_LAYER - 1,
                         )
+                    elif pruned_cfg.method == "anchorprune":
+                        # AnchorPrune's importance prior: received
+                        # attention at the deepest encoder layer (the
+                        # analog of the paper's last full-attention
+                        # block). Single-layer capture, like HyDART.
+                        capture_layer_idxs = (len(vt.encoder.layers) - 1,)
                     else:
                         capture_layer_idxs = (
                             GEMMA4_OBJECT_LAYER - 1,
@@ -1982,6 +1996,52 @@ class Gemma4ForConditionalGeneration(
                         object_layer=GEMMA4_OBJECT_LAYER,
                         lambda_seed=lambda_seed,
                         lambda_pick=lambda_pick,
+                    )
+                elif method == "anchorprune":
+                    # AnchorPrune (unofficial Gemma analog — the paper
+                    # covers LLaVA and Qwen only): importance prior =
+                    # received attention at the deepest encoder layer
+                    # (captured into the `shallow` slot above, deep is
+                    # None). Relevance and novelty run in LM space via
+                    # the same projection HyDART uses.
+                    lm_embeds = self.embed_vision(
+                        inputs_embeds=valid_states.to(self.model_dtype).unsqueeze(0)
+                    ).squeeze(0)
+                    pid = prompt_ids[orig_idx]
+                    if pid is not None and pid.numel():
+                        embed_tokens = self.language_model.model.embed_tokens
+                        prompt_embeds = embed_tokens(pid.long()).float()
+                    else:
+                        prompt_embeds = None
+                    # Same count function as the processor's placeholder
+                    # sizing (_hiprune_keep_count generic path).
+                    k_total = compute_retained_tokens_count(num_soft, ratio)
+                    kept_idx, kept_mask, anchor_idx, expansion_idx = (
+                        anchorprune_select(
+                            lm_embeds,
+                            shallow,
+                            prompt_embeds,
+                            k_total,
+                            anchor_kmin=cfg.anchor_kmin,
+                            tau=cfg.tau,
+                        )
+                    )
+                    valid_states = valid_states[kept_mask]
+                    hiprune_metadata[orig_idx] = build_anchorprune_metadata(
+                        anchor_idx,
+                        expansion_idx,
+                        kept_mask,
+                        grid_w,
+                        grid_h,
+                        ratio,
+                        anchor_kmin_used=anchorprune_resolve_kmin(
+                            k_total, cfg.anchor_kmin
+                        ),
+                        tau=cfg.tau,
+                        num_prompt_tokens=(
+                            0 if prompt_embeds is None
+                            else int(prompt_embeds.shape[0])
+                        ),
                     )
                 elif method == "hiprune_pp":
                     assert deep is not None

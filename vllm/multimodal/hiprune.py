@@ -113,6 +113,18 @@ DEFAULT_DART_LAYER = 2
 DEFAULT_NPRUNE_STRIDE = 2
 NPRUNE_ALLOWED_STRIDES = (1, 2)
 
+# AnchorPrune (Oh & Kim, ECCV'26) paper settings. tau is the Stage-1
+# novelty threshold; patience the cumulative high-novelty count that
+# ends anchor expansion; kmax_ratio the Stage-1 upper bound. The
+# k_min auto ratio reproduces the published budgets exactly
+# (K=32 -> 5, 64 -> 10, 128 -> 20, i.e. 5/32 of K).
+DEFAULT_ANCHORPRUNE_TAU = 0.2
+ANCHORPRUNE_PATIENCE = 3
+ANCHORPRUNE_KMAX_RATIO = 0.5
+ANCHORPRUNE_KMIN_RATIO = 5.0 / 32.0
+# Sentinel for "derive k_min from k_total" in kwargs/config packing.
+ANCHORPRUNE_KMIN_AUTO = -1
+
 
 def get_hiprune_method(merged_kwargs: Mapping[str, object] | None = None) -> str:
     """Selection method for ``--enable-hiprune`` servers.
@@ -121,8 +133,8 @@ def get_hiprune_method(merged_kwargs: Mapping[str, object] | None = None) -> str
     (attached by the API layer from the ``token_pruning_method`` chat
     field), falling back to the ``HIPRUNE_METHOD`` env var so
     env-configured servers and scripts keep working. One of ``hiprune``
-    (default), ``hydart``, ``hiprune_pp``, ``dart``, ``nprune`` or
-    ``checkered``.
+    (default), ``hydart``, ``hiprune_pp``, ``dart``, ``nprune``,
+    ``checkered`` or ``anchorprune``.
     """
     val = merged_kwargs.get("hiprune_method") if merged_kwargs else None
     if val is None:
@@ -135,10 +147,11 @@ def get_hiprune_method(merged_kwargs: Mapping[str, object] | None = None) -> str
         "dart",
         "nprune",
         "checkered",
+        "anchorprune",
     ):
         raise ValueError(
             "hiprune method must be 'hiprune', 'hydart', 'hiprune_pp', "
-            f"'dart', 'nprune' or 'checkered', got {method!r}"
+            f"'dart', 'nprune', 'checkered' or 'anchorprune', got {method!r}"
         )
     return method
 
@@ -232,6 +245,47 @@ def get_nprune_stride(merged_kwargs: Mapping[str, object] | None = None) -> int:
     return stride
 
 
+def get_anchorprune_kmin(
+    merged_kwargs: Mapping[str, object] | None = None,
+) -> int:
+    """AnchorPrune minimum protected relevance-anchor size ``K_min``.
+
+    Per-request ``hiprune_anchor_kmin`` mm kwarg, else
+    ``HIPRUNE_ANCHORPRUNE_KMIN`` env, else the auto sentinel (-1):
+    derive ``max(1, round(k_total * 5/32))`` at selection time, which
+    reproduces the paper's published (K, K_min) pairs exactly.
+    """
+    val = merged_kwargs.get("hiprune_anchor_kmin") if merged_kwargs else None
+    if val is None:
+        val = os.environ.get("HIPRUNE_ANCHORPRUNE_KMIN", ANCHORPRUNE_KMIN_AUTO)
+    kmin = int(float(val))  # type: ignore[arg-type]
+    if kmin != ANCHORPRUNE_KMIN_AUTO and kmin < 1:
+        raise ValueError(
+            f"anchorprune k_min must be >= 1 (or {ANCHORPRUNE_KMIN_AUTO} "
+            f"for auto), got {kmin}"
+        )
+    return kmin
+
+
+def get_anchorprune_tau(
+    merged_kwargs: Mapping[str, object] | None = None,
+) -> float:
+    """AnchorPrune Stage-1 novelty threshold ``tau``.
+
+    Per-request ``hiprune_tau`` mm kwarg, else ``HIPRUNE_ANCHORPRUNE_TAU``
+    env, else the paper default 0.2.
+    """
+    val = merged_kwargs.get("hiprune_tau") if merged_kwargs else None
+    if val is None:
+        val = os.environ.get("HIPRUNE_ANCHORPRUNE_TAU", DEFAULT_ANCHORPRUNE_TAU)
+    tau = float(val)  # type: ignore[arg-type]
+    if not 0.0 < tau <= 2.0:
+        raise ValueError(
+            f"anchorprune tau must be in (0, 2] (cosine distance), got {tau}"
+        )
+    return tau
+
+
 # All vLLM-side pruning keys that may appear in mm_processor_kwargs.
 # Model processors strip these before calling the HF processor.
 HIPRUNE_MM_KWARG_KEYS = (
@@ -244,6 +298,8 @@ HIPRUNE_MM_KWARG_KEYS = (
     "hiprune_pivot_image",
     "hiprune_pivot_text",
     "hiprune_stride",
+    "hiprune_anchor_kmin",
+    "hiprune_tau",
 )
 
 # Method <-> id mapping for the packed per-image config tensor (mm
@@ -255,12 +311,13 @@ HIPRUNE_METHOD_IDS: dict[str, int] = {
     "dart": 3,
     "nprune": 4,
     "checkered": 5,
+    "anchorprune": 6,
 }
 _HIPRUNE_ID_METHODS = {v: k for k, v in HIPRUNE_METHOD_IDS.items()}
 
 # Row layout of the packed config: (method_id, lambda_seed, lambda_pick,
-# beta, pivot_image, pivot_text, stride).
-HIPRUNE_CONFIG_WIDTH = 7
+# beta, pivot_image, pivot_text, stride, anchor_kmin, tau).
+HIPRUNE_CONFIG_WIDTH = 9
 
 
 @dataclass(frozen=True)
@@ -274,6 +331,8 @@ class HipruneConfig:
     pivot_image: int
     pivot_text: int
     stride: int
+    anchor_kmin: int
+    tau: float
 
 
 def pack_hiprune_config(
@@ -291,6 +350,8 @@ def pack_hiprune_config(
     beta = get_hiprune_pp_beta(merged_kwargs)
     pivot_image, pivot_text = get_dart_pivots(merged_kwargs)
     stride = get_nprune_stride(merged_kwargs)
+    anchor_kmin = get_anchorprune_kmin(merged_kwargs)
+    tau = get_anchorprune_tau(merged_kwargs)
     return torch.tensor(
         [
             float(HIPRUNE_METHOD_IDS[method]),
@@ -300,6 +361,8 @@ def pack_hiprune_config(
             float(pivot_image),
             float(pivot_text),
             float(stride),
+            float(anchor_kmin),
+            tau,
         ],
         dtype=torch.float32,
     )
@@ -326,6 +389,8 @@ def unpack_hiprune_config(row: torch.Tensor | None) -> HipruneConfig:
         pivot_image=int(round(vals[4])),
         pivot_text=int(round(vals[5])),
         stride=int(round(vals[6])),
+        anchor_kmin=int(round(vals[7])),
+        tau=vals[8],
     )
 
 
@@ -523,6 +588,157 @@ def checkered_select(
     kept_idx = kept_mask.nonzero(as_tuple=True)[0]
     assert int(kept_mask.sum()) == checkered_keep_count(grid_h * grid_w)
     return kept_idx, kept_mask
+
+
+def anchorprune_resolve_kmin(k_total: int, anchor_kmin: int) -> int:
+    """Effective Stage-1 ``K_min``: explicit, or the paper's 5/32 auto.
+
+    The auto ratio reproduces the published (K, K_min) pairs exactly:
+    32 -> 5, 64 -> 10, 128 -> 20. Clamped to ``[1, k_total]``.
+    """
+    if anchor_kmin == ANCHORPRUNE_KMIN_AUTO:
+        kmin = max(1, round(k_total * ANCHORPRUNE_KMIN_RATIO))
+    else:
+        kmin = anchor_kmin
+    return min(max(1, kmin), k_total)
+
+
+def anchorprune_select(
+    embeds: torch.Tensor,
+    importance: torch.Tensor,
+    prompt_embeds: torch.Tensor | None,
+    k_total: int,
+    anchor_kmin: int = ANCHORPRUNE_KMIN_AUTO,
+    tau: float = DEFAULT_ANCHORPRUNE_TAU,
+    patience: int = ANCHORPRUNE_PATIENCE,
+    kmax_ratio: float = ANCHORPRUNE_KMAX_RATIO,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """AnchorPrune: relevance-anchored contextual expansion (arXiv
+    2607.07033, ECCV'26). Faithful port of the official selector
+    (``AnchorPrune/anchorprune/selection.py``) with this codebase's
+    LM-space signals.
+
+    Stage 1 — protected relevance anchor: rank tokens by query
+    relevance (token-wise max cosine similarity of the LM-space visual
+    embeddings against the prompt's LM token embeddings — the official
+    Qwen adapter's signal, used here for every model). Always keep the
+    top ``K_min``; scan the ranking down to ``kmax_ratio * K``, and
+    stop after ``patience`` candidates whose novelty (min cosine
+    distance to the initial ``K_min`` anchor) exceeds ``tau`` —
+    cumulative counting, the released paper setting. No diversity
+    penalty applies inside the anchor.
+
+    Stage 2 — importance-weighted expansion: greedily add the token
+    maximizing ``p_i * Delta(i; S)`` (importance prior times min cosine
+    distance to the retained set) until exactly ``k_total`` tokens are
+    kept.
+
+    Empty/missing prompt: the anchor is empty and Stage 2 fills the
+    whole budget seeded from the importance argmax (the selector's own
+    ``preselected=None`` behavior). The kept COUNT never depends on the
+    prompt — the processor/model placeholder invariant.
+
+    Args:
+        embeds: ``(N, D)`` LM-space visual embeddings (used for both
+            Stage-1 novelty and Stage-2 expansion distance, matching
+            the official Qwen adapter).
+        importance: ``(N,)`` global importance prior ``p_i`` (received
+            attention mass; only relative order matters — Stage-2
+            argmax is invariant to positive rescaling).
+        prompt_embeds: ``(P, D)`` LM token embeddings of the prompt, or
+            ``None``/empty when the request has no usable prompt.
+        k_total: exact number of tokens to keep (clamped to ``N``).
+
+    Returns:
+        ``(kept_idx, kept_mask, anchor_idx, expansion_idx)`` —
+        ``kept_idx`` ascending raster order with exactly
+        ``min(k_total, N)`` entries (asserted); ``anchor_idx`` in
+        relevance-rank order; ``expansion_idx`` in greedy pick order;
+        the two are disjoint and their union is the kept set.
+    """
+    num_tokens = int(embeds.shape[0])
+    if num_tokens <= 0:
+        raise ValueError("anchorprune requires at least one visual token")
+    if importance.shape[0] != num_tokens:
+        raise ValueError(
+            f"importance length {importance.shape[0]} != token count "
+            f"{num_tokens}"
+        )
+    k_total = min(max(1, int(k_total)), num_tokens)
+    device = embeds.device
+
+    feats = torch.nn.functional.normalize(embeds.float(), dim=-1)
+    weights = torch.clamp(importance.float().to(device), min=0.0)
+
+    # ---- Stage 1: protected relevance anchor -------------------------
+    if prompt_embeds is not None and prompt_embeds.numel():
+        q = torch.nn.functional.normalize(
+            prompt_embeds.float().to(device), dim=-1
+        )
+        # Token-wise max matching (the official Qwen "max" aggregation).
+        relevance = (feats @ q.t()).max(dim=-1).values
+        ranked = torch.argsort(relevance, descending=True)
+
+        k_min_eff = anchorprune_resolve_kmin(k_total, anchor_kmin)
+        k_max_eff = max(k_min_eff, int(float(kmax_ratio) * k_total))
+        k_max_eff = min(k_max_eff, k_total, num_tokens)
+        patience = max(1, int(patience))
+
+        chosen = k_max_eff
+        if k_max_eff > k_min_eff:
+            anchor_feats = feats.index_select(0, ranked[:k_min_eff])
+            novelty_events = 0
+            for t in range(k_min_eff + 1, k_max_eff + 1):
+                cand = feats.index_select(0, ranked[t - 1].view(1))
+                delta = float((1.0 - cand @ anchor_feats.t()).min())
+                if delta > tau:
+                    novelty_events += 1
+                if novelty_events >= patience:
+                    chosen = t
+                    break
+        anchor_idx = ranked[:chosen]
+    else:
+        # No prompt: no relevance signal, no anchor. Deterministic and
+        # count-preserving — Stage 2 fills the whole budget.
+        anchor_idx = torch.empty(0, dtype=torch.long, device=device)
+
+    # ---- Stage 2: importance-weighted expansion ----------------------
+    selected: list[int] = anchor_idx.tolist()
+    selected_mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+    if selected:
+        selected_mask[anchor_idx] = True
+    else:
+        first = int(torch.argmax(weights))
+        selected.append(first)
+        selected_mask[first] = True
+
+    expansion: list[int] = [] if anchor_idx.numel() else selected[:]
+    sel_t = torch.tensor(selected, dtype=torch.long, device=device)
+    min_dist = torch.ones(num_tokens, dtype=torch.float32, device=device)
+    dist_to_selected = 1.0 - feats @ feats.index_select(0, sel_t).t()
+    min_dist = torch.minimum(min_dist, dist_to_selected.min(dim=1).values)
+    min_dist[selected_mask] = -1e9
+
+    while len(selected) < k_total:
+        score = min_dist * weights
+        score[selected_mask] = -1e9
+        nxt = int(torch.argmax(score))
+        selected.append(nxt)
+        expansion.append(nxt)
+        selected_mask[nxt] = True
+        dist_to_next = 1.0 - feats @ feats[nxt]
+        min_dist = torch.minimum(min_dist, dist_to_next)
+        min_dist[nxt] = -1e9
+
+    kept_idx = torch.sort(
+        torch.tensor(selected, dtype=torch.long, device=device)
+    ).values
+    kept_mask = selected_mask
+    expansion_idx = torch.tensor(expansion, dtype=torch.long, device=device)
+    assert int(kept_idx.numel()) == k_total, (
+        f"anchorprune kept {int(kept_idx.numel())} tokens, budget {k_total}"
+    )
+    return kept_idx, kept_mask, anchor_idx, expansion_idx
 
 
 def dart_keep_count(
@@ -1405,4 +1621,41 @@ def build_checkered_metadata(
         "retention": int(kept_idx.numel()) / num_tokens,
         "pruned": pruned_idx.tolist(),
         "uniform": kept_idx.tolist(),
+    }
+
+
+def build_anchorprune_metadata(
+    anchor_idx: torch.Tensor,
+    expansion_idx: torch.Tensor,
+    kept_mask: torch.Tensor,
+    grid_w: int,
+    grid_h: int,
+    retention: float,
+    anchor_kmin_used: int,
+    tau: float,
+    num_prompt_tokens: int,
+) -> dict[str, object]:
+    """JSON-safe per-image AnchorPrune metadata for API reporting.
+
+    Categories: ``anchors`` (the protected relevance anchor, in
+    relevance-rank order) and ``expansion`` (importance-weighted
+    novelty picks, in greedy pick order) — disjoint, together the kept
+    set. ``num_prompt_tokens`` reports how many prompt tokens guided
+    Stage 1 (0 = no prompt: empty anchor, expansion filled the whole
+    budget). ``anchor_kmin`` is the *effective* K_min used (the auto
+    sentinel already resolved).
+    """
+    num_tokens = int(kept_mask.shape[0])
+    pruned_idx = (~kept_mask).nonzero(as_tuple=True)[0]
+    return {
+        "method": "anchorprune",
+        "grid": [grid_w, grid_h],
+        "num_tokens": num_tokens,
+        "retention": retention,
+        "anchor_kmin": int(anchor_kmin_used),
+        "tau": float(tau),
+        "num_prompt_tokens": int(num_prompt_tokens),
+        "pruned": pruned_idx.tolist(),
+        "anchors": anchor_idx.tolist(),
+        "expansion": expansion_idx.tolist(),
     }

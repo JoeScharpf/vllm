@@ -38,6 +38,12 @@ from vllm.multimodal.hiprune import (
     checkered_keep_count,
     checkered_select,
     build_checkered_metadata,
+    anchorprune_resolve_kmin,
+    anchorprune_select,
+    build_anchorprune_metadata,
+    get_anchorprune_kmin,
+    get_anchorprune_tau,
+    ANCHORPRUNE_KMIN_AUTO,
     pack_hiprune_config,
     unpack_hiprune_config,
     HIPRUNE_CONFIG_WIDTH,
@@ -1472,6 +1478,8 @@ def test_hiprune_mm_kwarg_keys_cover_pack_inputs():
         "hiprune_pivot_image",
         "hiprune_pivot_text",
         "hiprune_stride",
+        "hiprune_anchor_kmin",
+        "hiprune_tau",
     }
 
 
@@ -1725,3 +1733,255 @@ def test_checkered_method_registration(monkeypatch):
     row = pack_hiprune_config({"hiprune_method": "checkered"})
     assert row.numel() == HIPRUNE_CONFIG_WIDTH
     assert unpack_hiprune_config(row).method == "checkered"
+
+
+# ---------------------------------------------------------------------------
+# AnchorPrune (arXiv 2607.07033): relevance-anchored contextual expansion
+# ---------------------------------------------------------------------------
+
+
+def _orthogonal_tokens(n: int) -> torch.Tensor:
+    """N mutually orthogonal token features (novelty 1 between any two)."""
+    return torch.eye(n)
+
+
+def _ranked_prompt(n: int, order: list[int] | None = None) -> torch.Tensor:
+    """A single prompt vector giving strictly decreasing relevance over
+    ``order`` (default: index order) against ``_orthogonal_tokens(n)``."""
+    order = order if order is not None else list(range(n))
+    q = torch.zeros(1, n)
+    for rank, tok in enumerate(order):
+        q[0, tok] = float(n - rank)
+    return q
+
+
+def _assert_anchorprune_invariants(
+    kept_idx: torch.Tensor,
+    kept_mask: torch.Tensor,
+    anchor_idx: torch.Tensor,
+    expansion_idx: torch.Tensor,
+    k_total: int,
+    num_tokens: int,
+) -> None:
+    # Exact budget — the processor/model placeholder invariant.
+    assert int(kept_idx.numel()) == int(kept_mask.sum()) == k_total
+    # Ascending, unique, in-range raster indices.
+    if kept_idx.numel() > 1:
+        assert (kept_idx[1:] > kept_idx[:-1]).all()
+    assert kept_idx.min() >= 0 and kept_idx.max() < num_tokens
+    assert kept_mask[kept_idx].all()
+    # Anchor and expansion partition the kept set.
+    a = set(anchor_idx.tolist())
+    e = set(expansion_idx.tolist())
+    assert a.isdisjoint(e)
+    assert a | e == set(kept_idx.tolist())
+
+
+@pytest.mark.parametrize("num_tokens", [9, 64, 216, 576])
+@pytest.mark.parametrize("ratio", [0.111, 0.25, 0.5, 0.9])
+def test_anchorprune_count_invariant(num_tokens: int, ratio: float):
+    """kept == compute_retained_tokens_count for every (N, ratio) — the
+    same count the processors use for placeholder sizing."""
+    torch.manual_seed(0)
+    embeds = torch.randn(num_tokens, 32)
+    importance = torch.rand(num_tokens)
+    prompt = torch.randn(7, 32)
+    k_total = compute_retained_tokens_count(num_tokens, ratio)
+    kept_idx, kept_mask, anchor_idx, expansion_idx = anchorprune_select(
+        embeds, importance, prompt, k_total
+    )
+    _assert_anchorprune_invariants(
+        kept_idx, kept_mask, anchor_idx, expansion_idx, k_total, num_tokens
+    )
+
+
+def test_anchorprune_kmin_auto_matches_paper():
+    """The auto K_min reproduces the published (K, K_min) pairs."""
+    assert anchorprune_resolve_kmin(32, ANCHORPRUNE_KMIN_AUTO) == 5
+    assert anchorprune_resolve_kmin(64, ANCHORPRUNE_KMIN_AUTO) == 10
+    assert anchorprune_resolve_kmin(128, ANCHORPRUNE_KMIN_AUTO) == 20
+    # Explicit values pass through, clamped to [1, k_total].
+    assert anchorprune_resolve_kmin(64, 7) == 7
+    assert anchorprune_resolve_kmin(4, 99) == 4
+    assert anchorprune_resolve_kmin(1, ANCHORPRUNE_KMIN_AUTO) == 1
+
+
+def test_anchorprune_empty_prompt_fallback():
+    """No prompt: empty anchor, Stage 2 fills the whole budget seeded
+    from the importance argmax. Count never depends on the prompt."""
+    n, k = 24, 6
+    embeds = _orthogonal_tokens(n)
+    importance = torch.arange(n, dtype=torch.float32)  # argmax = n-1
+    for prompt in (None, torch.zeros(0, n)):
+        kept_idx, kept_mask, anchor_idx, expansion_idx = anchorprune_select(
+            embeds, importance, prompt, k
+        )
+        _assert_anchorprune_invariants(
+            kept_idx, kept_mask, anchor_idx, expansion_idx, k, n
+        )
+        assert anchor_idx.numel() == 0
+        assert expansion_idx[0].item() == n - 1  # importance seed
+
+
+def test_anchorprune_expansion_follows_importance():
+    """With orthogonal features (equal novelty everywhere) and no
+    prompt, the greedy expansion is exactly the importance top-k."""
+    n, k = 16, 5
+    embeds = _orthogonal_tokens(n)
+    importance = torch.tensor(
+        [float((i * 7) % n) for i in range(n)]
+    )  # distinct, scrambled
+    kept_idx, _, _, _ = anchorprune_select(embeds, importance, None, k)
+    expected = torch.topk(importance, k).indices
+    assert set(kept_idx.tolist()) == set(expected.tolist())
+
+
+def test_anchorprune_anchor_protected_and_ranked():
+    """The top-relevance tokens are always kept (protected), in
+    relevance-rank order, even with zero importance."""
+    n, k = 40, 20
+    embeds = _orthogonal_tokens(n)
+    order = list(reversed(range(n)))  # relevance rank 39, 38, ...
+    prompt = _ranked_prompt(n, order)
+    importance = torch.zeros(n)  # importance cannot displace the anchor
+    kept_idx, kept_mask, anchor_idx, _ = anchorprune_select(
+        embeds, importance, prompt, k, anchor_kmin=3
+    )
+    # Orthogonal features: every scanned candidate is maximally novel,
+    # so the anchor stops after `patience` (3) events: 3 + 3 = 6
+    # (well below the kmax cap of 10).
+    assert anchor_idx.tolist() == order[:6]
+    assert all(kept_mask[i] for i in order[:6])
+
+
+def test_anchorprune_tau_patience_anchor_growth():
+    """Anchor sizing: orthogonal features stop at K_min + patience;
+    identical features (novelty 0) grow to the kmax cap."""
+    n, k = 32, 16
+    prompt = _ranked_prompt(n)
+    importance = torch.rand(n)
+
+    # All-novel: cumulative patience (3) fires immediately.
+    _, _, anchor_idx, _ = anchorprune_select(
+        _orthogonal_tokens(n), importance, prompt, k, anchor_kmin=4
+    )
+    assert anchor_idx.numel() == 4 + 3
+
+    # No novelty at all (identical features): anchor hits the cap
+    # kmax_ratio * k_total = 8. (Relevance ties: ranking arbitrary but
+    # size deterministic.)
+    same = torch.ones(n, 8)
+    _, _, anchor_idx, _ = anchorprune_select(
+        same, importance, torch.ones(1, 8), k, anchor_kmin=4
+    )
+    assert anchor_idx.numel() == 8
+
+    # Huge tau: nothing counts as novel -> cap as well.
+    _, _, anchor_idx, _ = anchorprune_select(
+        _orthogonal_tokens(n), importance, prompt, k, anchor_kmin=4, tau=1.5
+    )
+    assert anchor_idx.numel() == 8
+
+
+def test_anchorprune_deterministic():
+    torch.manual_seed(7)
+    embeds = torch.randn(100, 16)
+    importance = torch.rand(100)
+    prompt = torch.randn(5, 16)
+    a = anchorprune_select(embeds, importance, prompt, 23)
+    b = anchorprune_select(embeds, importance, prompt, 23)
+    for x, y in zip(a, b):
+        assert torch.equal(x, y)
+
+
+def test_anchorprune_importance_scale_invariant():
+    """Stage-2 argmax is invariant to positive rescaling of the
+    importance prior (normalization differences are irrelevant)."""
+    torch.manual_seed(3)
+    embeds = torch.randn(50, 16)
+    importance = torch.rand(50)
+    prompt = torch.randn(4, 16)
+    a = anchorprune_select(embeds, importance, prompt, 12)
+    b = anchorprune_select(embeds, importance * 1000.0, prompt, 12)
+    assert torch.equal(a[0], b[0])
+
+
+def test_anchorprune_metadata_contents():
+    torch.manual_seed(1)
+    n, k = 64, 16
+    embeds = torch.randn(n, 16)
+    importance = torch.rand(n)
+    prompt = torch.randn(6, 16)
+    kept_idx, kept_mask, anchor_idx, expansion_idx = anchorprune_select(
+        embeds, importance, prompt, k
+    )
+    md = build_anchorprune_metadata(
+        anchor_idx,
+        expansion_idx,
+        kept_mask,
+        8,
+        8,
+        0.25,
+        anchor_kmin_used=anchorprune_resolve_kmin(k, ANCHORPRUNE_KMIN_AUTO),
+        tau=0.2,
+        num_prompt_tokens=6,
+    )
+    assert md["method"] == "anchorprune"
+    assert md["grid"] == [8, 8]
+    assert md["num_tokens"] == n
+    assert md["anchor_kmin"] == 2  # round(16 * 5/32) = round(2.5) -> 2
+    assert md["num_prompt_tokens"] == 6
+    assert sorted(md["anchors"] + md["expansion"] + md["pruned"]) == list(
+        range(n)
+    )
+    assert set(md["anchors"]).isdisjoint(md["expansion"])
+    import json
+
+    json.dumps(md)
+
+
+def test_anchorprune_method_registration(monkeypatch):
+    assert HIPRUNE_METHOD_IDS["anchorprune"] == 6
+    assert (
+        get_hiprune_method({"hiprune_method": "anchorprune"}) == "anchorprune"
+    )
+    monkeypatch.setenv("HIPRUNE_METHOD", "anchorprune")
+    assert get_hiprune_method() == "anchorprune"
+    # Knobs round-trip through the packed config row.
+    row = pack_hiprune_config(
+        {
+            "hiprune_method": "anchorprune",
+            "hiprune_anchor_kmin": 12,
+            "hiprune_tau": 0.35,
+        }
+    )
+    assert row.numel() == HIPRUNE_CONFIG_WIDTH
+    cfg = unpack_hiprune_config(row)
+    assert cfg.method == "anchorprune"
+    assert cfg.anchor_kmin == 12
+    assert cfg.tau == pytest.approx(0.35)
+    # Defaults: auto kmin sentinel and paper tau.
+    cfg = unpack_hiprune_config(pack_hiprune_config({"hiprune_method": "anchorprune"}))
+    assert cfg.anchor_kmin == ANCHORPRUNE_KMIN_AUTO
+    assert cfg.tau == pytest.approx(0.2)
+
+
+def test_get_anchorprune_getters(monkeypatch):
+    monkeypatch.delenv("HIPRUNE_ANCHORPRUNE_KMIN", raising=False)
+    monkeypatch.delenv("HIPRUNE_ANCHORPRUNE_TAU", raising=False)
+    assert get_anchorprune_kmin() == ANCHORPRUNE_KMIN_AUTO
+    assert get_anchorprune_kmin({"hiprune_anchor_kmin": 8}) == 8
+    assert get_anchorprune_tau() == pytest.approx(0.2)
+    assert get_anchorprune_tau({"hiprune_tau": 0.4}) == pytest.approx(0.4)
+    # kwargs win over env.
+    monkeypatch.setenv("HIPRUNE_ANCHORPRUNE_KMIN", "6")
+    monkeypatch.setenv("HIPRUNE_ANCHORPRUNE_TAU", "0.3")
+    assert get_anchorprune_kmin() == 6
+    assert get_anchorprune_tau() == pytest.approx(0.3)
+    assert get_anchorprune_kmin({"hiprune_anchor_kmin": 2}) == 2
+    with pytest.raises(ValueError):
+        get_anchorprune_kmin({"hiprune_anchor_kmin": 0})
+    with pytest.raises(ValueError):
+        get_anchorprune_tau({"hiprune_tau": 0.0})
+    with pytest.raises(ValueError):
+        get_anchorprune_tau({"hiprune_tau": 2.5})
