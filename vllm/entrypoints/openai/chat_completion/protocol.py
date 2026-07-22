@@ -387,6 +387,27 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "'token_pruning_metadata'."
         ),
     )
+    token_pruning_method: str | None = Field(
+        default=None,
+        description=(
+            "Selection method for token_pruning: 'hiprune' (default), "
+            "'hydart', 'hiprune_pp', 'dart', 'nprune' or 'checkered'. "
+            "Per-request — the same running server can serve different "
+            "methods. Shorthand for "
+            "mm_processor_kwargs={'hiprune_method': ...}. Omitted: the "
+            "server's HIPRUNE_METHOD env var (default 'hiprune')."
+        ),
+    )
+    token_pruning_params: dict[str, float] | None = Field(
+        default=None,
+        description=(
+            "Per-request pruning knobs: lambda_seed / lambda_pick "
+            "(HyDART), beta (HiPrune++), pivot_image / pivot_text "
+            "(DART), stride (NPrune). Unknown keys are rejected. Each "
+            "maps onto the corresponding hiprune_* mm-processor kwarg; "
+            "omitted knobs fall back to the server env / paper defaults."
+        ),
+    )
     structured_outputs: StructuredOutputsParams | None = Field(
         default=None,
         description="Additional kwargs for structured outputs",
@@ -980,15 +1001,80 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="after")
     def merge_token_pruning_into_mm_kwargs(self):
-        """Map the top-level token_pruning field onto the HiPrune
-        mm-processor kwarg so it reaches the multimodal processor (and
-        thus the mm/prefix-cache hash) through the standard path."""
+        """Map the top-level token_pruning fields onto the HiPrune
+        mm-processor kwargs so they reach the multimodal processor (and
+        thus the mm/prefix-cache hash) through the standard path.
+
+        The method and knobs participate in the mm-cache hash by
+        construction: the same image pruned under a different method (or
+        different knobs) keeps different tokens, so they must key the
+        cache.
+
+        Under the prompt-aware methods — ``hiprune_pp`` (text-relevance
+        guidance) and ``dart`` (text pivots for the duplication test) —
+        the text of the latest user message is attached as
+        ``hiprune_prompt`` too, deliberately making the mm-cache hash
+        prompt-dependent. Other methods never attach it, so their cache
+        behavior is unchanged.
+        """
         if self.token_pruning is not None:
-            self.mm_processor_kwargs = {
+            mm_kwargs: dict[str, Any] = {
                 **(self.mm_processor_kwargs or {}),
                 "hiprune_ratio": self.token_pruning,
             }
+            if self.token_pruning_method is not None:
+                mm_kwargs["hiprune_method"] = self.token_pruning_method
+            if self.token_pruning_params:
+                param_to_mm_key = {
+                    "lambda_seed": "hiprune_lambda_seed",
+                    "lambda_pick": "hiprune_lambda_pick",
+                    "beta": "hiprune_beta",
+                    "pivot_image": "hiprune_pivot_image",
+                    "pivot_text": "hiprune_pivot_text",
+                    "stride": "hiprune_stride",
+                }
+                unknown = set(self.token_pruning_params) - set(param_to_mm_key)
+                if unknown:
+                    raise VLLMValidationError(
+                        f"Unknown token_pruning_params keys: {sorted(unknown)}. "
+                        f"Supported: {sorted(param_to_mm_key)}",
+                        parameter="token_pruning_params",
+                    )
+                for key, value in self.token_pruning_params.items():
+                    mm_kwargs[param_to_mm_key[key]] = float(value)
+            self.mm_processor_kwargs = mm_kwargs
+
+            from vllm.multimodal.hiprune import get_hiprune_method
+
+            # Validates the method (per-request or env) and gates the
+            # prompt attach on the *request's* effective method.
+            if get_hiprune_method(mm_kwargs) in ("hiprune_pp", "dart"):
+                prompt = self._extract_latest_user_text()
+                if prompt:
+                    mm_kwargs["hiprune_prompt"] = prompt
         return self
+
+    def _extract_latest_user_text(self) -> str:
+        """Text parts of the latest user message (HiPrune++ guidance).
+
+        Matches the paper's single-instruction setting: only the current
+        question guides token selection, not the conversation history.
+        """
+        for message in reversed(self.messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = [
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ]
+                return "\n".join(p for p in parts if p)
+            return ""
+        return ""
 
     @model_validator(mode="before")
     @classmethod

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from abc import abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Final, Literal, Protocol, TypeAlias, TypeVar
@@ -26,6 +27,42 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelL
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import BaseMultiModalProcessorCache
+from vllm.multimodal.dart_scoring import dart_prefix_states_llama
+from vllm.multimodal.hiprune import (
+    LLAVA_OBJECT_LAYER,
+    build_dart_metadata,
+    build_checkered_metadata,
+    build_hiprune_metadata,
+    build_hiprune_pp_metadata,
+    build_hydart_metadata,
+    build_nprune_metadata,
+    checkered_keep_count,
+    checkered_select,
+    dart_keep_count,
+    dart_select,
+    get_dart_layer,
+    get_dart_pivots,
+    get_hiprune_method,
+    get_hiprune_pp_beta,
+    get_hiprune_prompt,
+    get_hiprune_ratio,
+    get_nprune_stride,
+    hiprune_pp_select,
+    hiprune_select,
+    hydart_select,
+    nprune_keep_count,
+    nprune_select,
+    pack_hiprune_config,
+    unpack_hiprune_config,
+    HIPRUNE_MM_KWARG_KEYS,
+    HipruneConfig,
+)
+from vllm.multimodal.hiprune import (
+    compute_hiprune_pp_budget as hiprune_pp_budget,
+)
+from vllm.multimodal.hiprune import (
+    compute_retained_tokens_count as hiprune_retained_tokens_count,
+)
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargsItems,
@@ -84,6 +121,34 @@ class LlavaImagePixelInputs(TensorSchema):
 
     type: Literal["pixel_values"] = "pixel_values"
     pixel_values: Annotated[torch.Tensor, TensorShape("bn", 3, "h", "w")]
+
+    # HiPrune retention ratio per image (fraction of patch tokens kept),
+    # emitted by the processor only when pruning is requested.
+    hiprune_ratio: Annotated[
+        torch.Tensor | None,
+        TensorShape("bn"),
+    ] = None
+
+    # HiPrune++ / DART prompt token ids, one identical row per image (the
+    # mm field machinery is per-item), emitted by the processor whenever
+    # pruning is requested (an empty row for methods that don't use the
+    # prompt, keeping field presence uniform across a mixed-method
+    # batch). "pl" (prompt length) is dynamic because a batch can span
+    # requests with different prompts (rows then arrive as a list of
+    # unequal-length tensors).
+    hiprune_prompt_ids: Annotated[
+        torch.Tensor | list[torch.Tensor] | None,
+        TensorShape("bn", "pl", dynamic_dims={"pl"}),
+    ] = None
+
+    # Packed per-image pruning config (method id + knobs; see
+    # pack_hiprune_config), emitted alongside hiprune_ratio so the model
+    # forward can dispatch the selection method per image — a batch may
+    # span requests with different methods.
+    hiprune_config: Annotated[
+        torch.Tensor | None,
+        TensorShape("bn", 7),
+    ] = None
 
 
 class PixtralHFImagePixelInputs(TensorSchema):
@@ -250,6 +315,10 @@ class LlavaDummyInputsBuilder(BaseDummyInputsBuilder[_I]):
 
 class LlavaProcessingInfo(BaseLlavaProcessingInfo):
     def get_hf_processor(self, **kwargs: object):
+        # hiprune_* are vLLM-side kwargs (placeholder sizing + model
+        # selection); the HF processor does not know them.
+        for key in HIPRUNE_MM_KWARG_KEYS:
+            kwargs.pop(key, None)
         hf_processor = self.ctx.get_hf_processor(LlavaProcessor, **kwargs)
         # In case patch_size is omitted from `processor_config.json`
         # e.g. for E5-V: https://huggingface.co/royokong/e5-v
@@ -312,7 +381,144 @@ class LlavaMultiModalProcessor(BaseLlavaMultiModalProcessor[LlavaProcessingInfo]
         return dict(
             pixel_values=MultiModalFieldConfig.batched("image"),
             image_embeds=MultiModalFieldConfig.batched("image"),
+            hiprune_ratio=MultiModalFieldConfig.batched("image"),
+            hiprune_prompt_ids=MultiModalFieldConfig.batched("image"),
+            hiprune_config=MultiModalFieldConfig.batched("image"),
         )
+
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        hiprune_ratio = get_hiprune_ratio(mm_kwargs)
+        hiprune_prompt = get_hiprune_prompt(mm_kwargs)
+        if hiprune_ratio is not None:
+            mm_config = self.info.ctx.get_mm_config()
+            if not mm_config.is_multimodal_pruning_enabled():
+                raise ValueError(
+                    "hiprune_ratio (token_pruning) requires the server to "
+                    "be started with --enable-hiprune."
+                )
+        # The HF processor does not know the vLLM-side kwargs.
+        hiprune_kwargs = mm_kwargs
+        mm_kwargs = {
+            k: v for k, v in mm_kwargs.items() if k not in HIPRUNE_MM_KWARG_KEYS
+        }
+
+        processed_outputs = super()._call_hf_processor(
+            prompt, mm_data, mm_kwargs, tok_kwargs
+        )
+
+        # HiPrune: attach the retention ratio and packed method/knob
+        # config per image so they reach the model at encode time (they
+        # are per-request). The prompt placeholder count is reduced in
+        # _get_prompt_updates with the same count function the model
+        # uses at selection time.
+        if hiprune_ratio is not None and "pixel_values" in processed_outputs:
+            num_images = len(processed_outputs["pixel_values"])
+            processed_outputs["hiprune_ratio"] = torch.full(
+                (num_images,), hiprune_ratio, dtype=torch.float32
+            )
+            processed_outputs["hiprune_config"] = (
+                pack_hiprune_config(hiprune_kwargs)
+                .unsqueeze(0)
+                .repeat(num_images, 1)
+            )
+            # HiPrune++ / DART: ship the prompt token ids to the model so
+            # it can embed them (LM embedding table) for text-guided
+            # selection (HiPrune++) or text pivots (DART). Always
+            # attached when pruning is requested — an empty row for
+            # methods that don't use the prompt — so field presence is
+            # uniform when a batch mixes methods across requests. One
+            # identical row per image — the mm field machinery is
+            # per-item.
+            ids: list[int] = []
+            if get_hiprune_method(hiprune_kwargs) in ("hiprune_pp", "dart"):
+                tokenizer = self.info.get_tokenizer()
+                if hiprune_prompt:
+                    ids = tokenizer.encode(hiprune_prompt, add_special_tokens=False)
+            processed_outputs["hiprune_prompt_ids"] = torch.tensor(
+                [ids], dtype=torch.long
+            ).repeat(num_images, 1)
+
+        return processed_outputs
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> Sequence[PromptUpdate]:
+        hf_config = self.info.get_hf_config()
+        image_token_id = hf_config.image_token_index
+        hiprune_ratio = get_hiprune_ratio(hf_processor_mm_kwargs)
+
+        def get_replacement(item_idx: int):
+            images = mm_items.get_items(
+                "image", (ImageEmbeddingItems, ImageProcessorItems)
+            )
+
+            if isinstance(images, ImageEmbeddingItems):
+                num_image_tokens = images.get_feature_size(item_idx)
+            else:
+                image_size = images.get_image_size(item_idx)
+                num_image_tokens = self.info.get_num_image_tokens(
+                    image_width=image_size.width,
+                    image_height=image_size.height,
+                )
+                # HiPrune: shrink the image placeholder run to the
+                # retained budget. The model keeps exactly this many
+                # tokens at encode time (same count function on both
+                # sides). HiPrune++ adds the text-guided tokens on top
+                # of the base budget (additive, per the paper); the
+                # count never depends on the prompt content.
+                if hiprune_ratio is not None:
+                    method = get_hiprune_method(hf_processor_mm_kwargs)
+                    if method == "hiprune_pp":
+                        base, t_sum = hiprune_pp_budget(
+                            num_image_tokens,
+                            hiprune_ratio,
+                            get_hiprune_pp_beta(hf_processor_mm_kwargs),
+                        )
+                        num_image_tokens = base + t_sum
+                    elif method == "dart":
+                        p_img, p_txt = get_dart_pivots(hf_processor_mm_kwargs)
+                        num_image_tokens = dart_keep_count(
+                            num_image_tokens, hiprune_ratio, p_img, p_txt
+                        )
+                    elif method == "nprune":
+                        # Grid-shape-aware count (exact lattice). LLaVA's
+                        # patch grid is square (24x24 for 336px CLIP).
+                        side = math.isqrt(num_image_tokens)
+                        assert side * side == num_image_tokens
+                        num_image_tokens = nprune_keep_count(
+                            side,
+                            side,
+                            get_nprune_stride(hf_processor_mm_kwargs),
+                        )
+                    elif method == "checkered":
+                        # Exact ceil(N/2), shape-independent — NOT the
+                        # ratio path (round(n*0.5) rounds half-to-even).
+                        num_image_tokens = checkered_keep_count(
+                            num_image_tokens
+                        )
+                    else:
+                        num_image_tokens = hiprune_retained_tokens_count(
+                            num_image_tokens, hiprune_ratio
+                        )
+
+            return [image_token_id] * num_image_tokens
+
+        return [
+            PromptReplacement(
+                modality="image",
+                target=[image_token_id],
+                replacement=get_replacement,
+            ),
+        ]
 
 
 class PixtralHFProcessingInfo(BaseLlavaProcessingInfo):
@@ -584,11 +790,22 @@ class LlavaForConditionalGeneration(
             self.language_model.make_empty_intermediate_tensors
         )
 
+        # HiPrune state for the most recent embed_multimodal call: per-item
+        # pruning metadata, read by the model runner and returned via
+        # token_pruning_metadata. LLaVA needs no kept-mask handoff (no
+        # mrope): shrinking the placeholder run already yields contiguous
+        # positions for the kept tokens.
+        self._hiprune_metadata: list[dict[str, object] | None] = []
+        self.hiprune_metadata_per_item: list[dict[str, object] | None] = []
+
     def _parse_and_validate_image_input(
         self, **kwargs: object
     ) -> LlavaImageInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)
         image_embeds = kwargs.pop("image_embeds", None)
+        hiprune_ratio = kwargs.pop("hiprune_ratio", None)
+        hiprune_prompt_ids = kwargs.pop("hiprune_prompt_ids", None)
+        hiprune_config = kwargs.pop("hiprune_config", None)
 
         if pixel_values is None and image_embeds is None:
             return None
@@ -604,6 +821,9 @@ class LlavaForConditionalGeneration(
             return LlavaImagePixelInputs(
                 type="pixel_values",
                 pixel_values=pixel_values,
+                hiprune_ratio=hiprune_ratio,
+                hiprune_prompt_ids=hiprune_prompt_ids,
+                hiprune_config=hiprune_config,
                 resolve_bindings={"h": expected_h, "w": expected_w},
             )
 
@@ -643,7 +863,41 @@ class LlavaForConditionalGeneration(
         image_input: LlavaImageInputs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         if image_input["type"] == "image_embeds":
+            self._hiprune_metadata = [None] * len(image_input["data"])
             return image_input["data"]
+
+        num_images = len(image_input["pixel_values"])
+        self._hiprune_metadata = [None] * num_images
+
+        ratios: list[float | None] = [None] * num_images
+        prompt_ids: list[torch.Tensor | None] = [None] * num_images
+        configs: list[HipruneConfig | None] = [None] * num_images
+        if image_input["type"] == "pixel_values":
+            hp_field = image_input.get("hiprune_ratio")
+            if hp_field is not None:
+                for idx in range(num_images):
+                    ratio = float(hp_field[idx])
+                    ratios[idx] = ratio if ratio < 1.0 else None
+            # HiPrune++ prompt ids, kept per image: a batch can span
+            # multiple requests with different prompts.
+            pid_field = image_input.get("hiprune_prompt_ids")
+            if pid_field is not None:
+                for idx in range(num_images):
+                    row = pid_field[idx]
+                    if row.numel():
+                        prompt_ids[idx] = row
+            # Packed method/knob config, kept per image: a batch can
+            # span requests with different methods.
+            cfg_field = image_input.get("hiprune_config")
+            for idx in range(num_images):
+                if ratios[idx] is not None:
+                    row = cfg_field[idx] if cfg_field is not None else None
+                    configs[idx] = unpack_hiprune_config(row)
+
+        if any(r is not None for r in ratios):
+            return self._process_image_input_hiprune(
+                image_input["pixel_values"], ratios, prompt_ids, configs
+            )
 
         image_features = self._process_image_pixels(image_input)
 
@@ -656,12 +910,289 @@ class LlavaForConditionalGeneration(
         image_embeds = torch.split(image_embeds, feature_sizes)
         return image_embeds
 
+    def _process_image_input_hiprune(
+        self,
+        pixel_values: torch.Tensor,
+        ratios: list[float | None],
+        prompt_ids: list[torch.Tensor | None] | None = None,
+        configs: list[HipruneConfig | None] | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Encode images one at a time, pruning with HiPrune where requested.
+
+        Images are encoded individually because the score capture computes
+        a dense attention softmax over the whole patch sequence, which
+        must not span keys from other images — exactly like the HiPrune
+        reference, which encodes one image at a time.
+
+        For each pruned image, the selection (HiPrune's
+        anchor/buffer/register, HyDART's anchor/buffer/diverse with
+        ``HIPRUNE_METHOD=hydart``, or HiPrune++'s
+        anchor/buffer/register/prompt with ``HIPRUNE_METHOD=hiprune_pp``)
+        keeps exactly the token count the processor used for the
+        placeholder run — ``compute_retained_tokens_count(num_tokens,
+        ratio)``, plus the text-guided extra for HiPrune++ — and the
+        metadata is stashed for the API layer.
+
+        HiPrune++ compares the projected patch embeddings (LM input
+        space, via ``multi_modal_projector``) against the mean LM
+        embedding of the image's ``prompt_ids`` entry; a missing/empty
+        prompt falls back to a zero text embedding (arbitrary text
+        picks, count unchanged).
+
+        DART (``HIPRUNE_METHOD=dart``) uses no vision-tower attention:
+        the projected embeddings and the LM embeddings of the prompt run
+        through the language model's first K decoder layers (aux pass,
+        ``vllm/multimodal/dart_scoring.py``); the layer-K key norms and
+        hidden states drive the official pivot + anti-duplication
+        selection.
+
+        Layer choices mirror the HiPrune authors' LLaVA-1.5 release: the
+        object layer is layer 9 (1-based) of the CLIP tower, and the deep
+        layer is the feature-select layer (-2, the last block vLLM loads
+        since the tower is truncated there).
+        """
+        tower = self.vision_tower
+        if not hasattr(tower, "forward_capturing_hiprune_scores"):
+            raise NotImplementedError(
+                "HiPrune token pruning is only wired into the CLIP vision "
+                f"tower; got {type(tower).__name__}."
+            )
+
+        strategy = self.config.vision_feature_select_strategy
+        if strategy != "default":
+            raise NotImplementedError(
+                "HiPrune for LLaVA assumes vision_feature_select_strategy="
+                f"'default' (CLS dropped); got {strategy!r}."
+            )
+
+        vision_config = self.config.vision_config
+        grid_w = grid_h = vision_config.image_size // vision_config.patch_size
+        num_tokens = grid_w * grid_h
+
+        num_loaded_layers = len(tower.vision_model.encoder.layers)
+        object_layer_idx = LLAVA_OBJECT_LAYER - 1
+        deep_layer_idx = num_loaded_layers - 1
+
+        # HiPrune++: per-image mean LM embedding of the prompt tokens.
+        def _text_embedding_for(idx: int) -> torch.Tensor | None:
+            if prompt_ids is None or prompt_ids[idx] is None:
+                return None
+            ids = prompt_ids[idx].long()
+            embed_tokens = self.language_model.model.embed_tokens
+            return embed_tokens(ids).float().mean(dim=0)
+
+        image_embeds_out: list[torch.Tensor] = []
+        for idx, ratio in enumerate(ratios):
+            pv = pixel_values[idx : idx + 1]
+            if ratio is None:
+                features = self._image_pixels_to_features(tower, pv)
+                image_embeds_out.append(self.multi_modal_projector(features)[0])
+                continue
+
+            # Per-image method dispatch: images are encoded individually
+            # anyway (see docstring), so a batch mixing methods across
+            # requests just takes a different branch per image.
+            cfg = (
+                configs[idx]
+                if configs is not None and configs[idx] is not None
+                else unpack_hiprune_config(None)
+            )
+            method = cfg.method
+
+            # NPrune: pure uniform-lattice sampling — no attention
+            # capture, no scores, no prompt. Plain tower forward.
+            if method == "nprune":
+                features = self._image_pixels_to_features(tower, pv)
+                embeds = self.multi_modal_projector(features)[0]
+                assert embeds.shape[0] == num_tokens
+                kept_idx, kept_mask = nprune_select(
+                    grid_h, grid_w, cfg.stride, device=embeds.device
+                )
+                metadata = build_nprune_metadata(
+                    kept_idx, kept_mask, grid_w, grid_h, cfg.stride
+                )
+                image_embeds_out.append(embeds[kept_mask])
+                self._hiprune_metadata[idx] = metadata
+                continue
+
+            # Checkered: deterministic checkerboard — no attention
+            # capture, no scores, no prompt. Plain tower forward.
+            if method == "checkered":
+                features = self._image_pixels_to_features(tower, pv)
+                embeds = self.multi_modal_projector(features)[0]
+                assert embeds.shape[0] == num_tokens
+                kept_idx, kept_mask = checkered_select(
+                    grid_h, grid_w, device=embeds.device
+                )
+                metadata = build_checkered_metadata(
+                    kept_idx, kept_mask, grid_w, grid_h
+                )
+                image_embeds_out.append(embeds[kept_mask])
+                self._hiprune_metadata[idx] = metadata
+                continue
+
+            if method == "dart":
+                features = self._image_pixels_to_features(tower, pv)
+                embeds = self.multi_modal_projector(features)[0]
+                assert embeds.shape[0] == num_tokens
+
+                lm = self.language_model.model
+                pid = prompt_ids[idx] if prompt_ids is not None else None
+                if pid is not None and pid.numel():
+                    text_embeds = lm.embed_tokens(
+                        pid.long().to(embeds.device)
+                    ).to(embeds.dtype)
+                else:
+                    text_embeds = embeds.new_zeros((0, embeds.shape[-1]))
+                seq_embeds = torch.cat([embeds, text_embeds], dim=0)
+                positions = torch.arange(
+                    seq_embeds.shape[0], device=embeds.device
+                )
+                dart_layer = get_dart_layer()
+                hidden, key_l1 = dart_prefix_states_llama(
+                    lm.layers, lm.norm, seq_embeds, positions, dart_layer
+                )
+                p_img, p_txt = cfg.pivot_image, cfg.pivot_text
+                img_piv, txt_piv, diverse_idx, kept_mask, pivot_sim = (
+                    dart_select(hidden, key_l1, num_tokens, ratio, p_img, p_txt)
+                )
+                metadata = build_dart_metadata(
+                    img_piv,
+                    diverse_idx,
+                    kept_mask,
+                    key_l1,
+                    pivot_sim,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    pivot_image=p_img,
+                    pivot_text=p_txt,
+                    num_text_pivots=int(txt_piv.numel()),
+                    dart_layer=dart_layer,
+                )
+                image_embeds_out.append(embeds[kept_mask])
+                self._hiprune_metadata[idx] = metadata
+                continue
+
+            # HyDART needs only the object-layer scores (its diverse fill
+            # uses embedding similarity, not deep attention).
+            if method == "hydart":
+                capture_layer_idxs: tuple[int, ...] = (object_layer_idx,)
+            else:
+                capture_layer_idxs = (object_layer_idx, deep_layer_idx)
+            features, scores_by_layer = tower.forward_capturing_hiprune_scores(
+                pv,
+                capture_layer_idxs=capture_layer_idxs,
+                feature_select_strategy=strategy,
+            )
+            embeds = self.multi_modal_projector(features)[0]
+            assert embeds.shape[0] == num_tokens
+
+            # Per-key scores cover the full CLIP sequence; drop the CLS
+            # key (index 0) to align with the 24x24 patch tokens, exactly
+            # like the reference (`attentions[layer].mean(1).mean(1)[0, 1:]`).
+            shallow = scores_by_layer[object_layer_idx][1:]
+
+            if method == "hydart":
+                lambda_seed, lambda_pick = cfg.lambda_seed, cfg.lambda_pick
+                anchor_idx, buffer_idx, diverse_idx, kept_mask, sim_stats = (
+                    hydart_select(
+                        shallow,
+                        embeds,
+                        num_tokens,
+                        grid_w,
+                        ratio,
+                        lambda_seed=lambda_seed,
+                        lambda_pick=lambda_pick,
+                    )
+                )
+                metadata = build_hydart_metadata(
+                    anchor_idx,
+                    buffer_idx,
+                    diverse_idx,
+                    kept_mask,
+                    shallow,
+                    sim_stats,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    object_layer=LLAVA_OBJECT_LAYER,
+                    lambda_seed=lambda_seed,
+                    lambda_pick=lambda_pick,
+                )
+            elif method == "hiprune_pp":
+                deep = scores_by_layer[deep_layer_idx][1:]
+                text_emb = _text_embedding_for(idx)
+                if text_emb is None:
+                    text_emb = embeds.new_zeros(
+                        embeds.shape[-1], dtype=torch.float32
+                    )
+                (
+                    anchor_idx,
+                    buffer_idx,
+                    register_idx,
+                    prompt_idx,
+                    kept_mask,
+                    text_similarity,
+                ) = hiprune_pp_select(
+                    shallow,
+                    deep,
+                    embeds,
+                    text_emb,
+                    num_tokens,
+                    grid_w,
+                    ratio,
+                    beta=cfg.beta,
+                )
+                metadata = build_hiprune_pp_metadata(
+                    anchor_idx,
+                    buffer_idx,
+                    register_idx,
+                    prompt_idx,
+                    kept_mask,
+                    shallow,
+                    deep,
+                    text_similarity,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    object_layer=LLAVA_OBJECT_LAYER,
+                    beta=cfg.beta,
+                )
+            else:
+                deep = scores_by_layer[deep_layer_idx][1:]
+                anchor_idx, buffer_idx, register_idx, kept_mask = hiprune_select(
+                    shallow, deep, num_tokens, grid_w, ratio
+                )
+                metadata = build_hiprune_metadata(
+                    anchor_idx,
+                    buffer_idx,
+                    register_idx,
+                    kept_mask,
+                    shallow,
+                    deep,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    object_layer=LLAVA_OBJECT_LAYER,
+                )
+            image_embeds_out.append(embeds[kept_mask])
+            self._hiprune_metadata[idx] = metadata
+
+        return tuple(image_embeds_out)
+
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
+            self.hiprune_metadata_per_item = []
             return []
 
-        return self._process_image_input(image_input)
+        embeddings = self._process_image_input(image_input)
+        # Per returned item: HiPrune metadata (None when the item was not
+        # pruned). The model runner reads this right after embed_multimodal
+        # to cache the metadata alongside the encoder outputs.
+        self.hiprune_metadata_per_item = list(self._hiprune_metadata)
+        return embeddings
 
     def forward(
         self,

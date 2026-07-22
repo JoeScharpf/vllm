@@ -73,12 +73,42 @@ from vllm.multimodal.evs import (
     compute_retention_mask,
     recompute_mrope_positions,
 )
+from vllm.multimodal.dart_scoring import (
+    dart_prefix_states_llama,
+    qwen2_5_vl_dart_positions,
+)
 from vllm.multimodal.hiprune import (
     QWEN2_5_VL_OBJECT_LAYER,
+    build_dart_metadata,
+    build_checkered_metadata,
     build_hiprune_metadata,
+    build_hydart_metadata,
+    build_hiprune_pp_metadata,
+    build_nprune_metadata,
+    checkered_keep_count,
+    checkered_select,
+    dart_keep_count,
+    dart_select,
     fold_merged_token_scores,
+    get_dart_layer,
+    get_dart_pivots,
+    get_hiprune_method,
+    get_hiprune_pp_beta,
+    get_hiprune_prompt,
     get_hiprune_ratio,
+    get_nprune_stride,
+    hiprune_pp_select,
     hiprune_select,
+    hydart_select,
+    nprune_keep_count,
+    nprune_select,
+    pack_hiprune_config,
+    unpack_hiprune_config,
+    HIPRUNE_MM_KWARG_KEYS,
+    HipruneConfig,
+)
+from vllm.multimodal.hiprune import (
+    compute_hiprune_pp_budget as hiprune_pp_budget,
 )
 from vllm.multimodal.hiprune import (
     compute_retained_tokens_count as hiprune_retained_tokens_count,
@@ -197,6 +227,27 @@ class Qwen2_5_VLImagePixelInputs(TensorSchema):
     hiprune_ratio: Annotated[
         torch.Tensor | None,
         TensorShape("ni"),
+    ] = None
+
+    # HiPrune++ / DART prompt token ids, one identical row per image (the
+    # mm field machinery is per-item), emitted by the processor whenever
+    # pruning is requested (an empty row for methods that don't use the
+    # prompt, keeping field presence uniform across a mixed-method
+    # batch). "pl" is the prompt length in tokens; it is dynamic because
+    # a batch can span requests with different prompts (rows then arrive
+    # as a list of unequal-length tensors).
+    hiprune_prompt_ids: Annotated[
+        torch.Tensor | list[torch.Tensor] | None,
+        TensorShape("ni", "pl", dynamic_dims={"pl"}),
+    ] = None
+
+    # Packed per-image pruning config (method id + knobs; see
+    # pack_hiprune_config), emitted alongside hiprune_ratio so the model
+    # forward can dispatch the selection method per image — a batch may
+    # span requests with different methods.
+    hiprune_config: Annotated[
+        torch.Tensor | None,
+        TensorShape("ni", 7),
     ] = None
 
 
@@ -1328,9 +1379,10 @@ class Qwen2_5_VLProcessingInfo(Qwen2VLProcessingInfo):
         return self.ctx.get_hf_config(Qwen2_5_VLConfig)
 
     def get_hf_processor(self, **kwargs: object) -> Qwen2_5_VLProcessor:
-        # hiprune_ratio is a vLLM-side kwarg (placeholder sizing + model
-        # selection); the HF processor does not know it.
-        kwargs.pop("hiprune_ratio", None)
+        # hiprune_* are vLLM-side kwargs (placeholder sizing + model
+        # selection); the HF processor does not know them.
+        for key in HIPRUNE_MM_KWARG_KEYS:
+            kwargs.pop(key, None)
         return self.ctx.get_hf_processor(
             Qwen2_5_VLProcessor,
             use_fast=kwargs.pop("use_fast", True),
@@ -1348,6 +1400,8 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
             **super()._get_mm_fields_config(hf_inputs, hf_processor_mm_kwargs),
             second_per_grid_ts=MultiModalFieldConfig.batched("video", keep_on_cpu=True),
             hiprune_ratio=MultiModalFieldConfig.batched("image"),
+            hiprune_prompt_ids=MultiModalFieldConfig.batched("image"),
+            hiprune_config=MultiModalFieldConfig.batched("image"),
         )
 
     def _call_hf_processor(
@@ -1358,6 +1412,7 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         hiprune_ratio = get_hiprune_ratio(mm_kwargs)
+        hiprune_prompt = get_hiprune_prompt(mm_kwargs)
         if hiprune_ratio is not None:
             mm_config = self.info.ctx.get_mm_config()
             if not mm_config.is_multimodal_pruning_enabled():
@@ -1366,10 +1421,11 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
                     "be started with --enable-hiprune, which activates the "
                     "multimodal-pruning position handling."
                 )
-            # The HF processor does not know the vLLM-side kwarg.
-            mm_kwargs = {
-                k: v for k, v in mm_kwargs.items() if k != "hiprune_ratio"
-            }
+        # The HF processor does not know the vLLM-side kwargs.
+        hiprune_kwargs = mm_kwargs
+        mm_kwargs = {
+            k: v for k, v in mm_kwargs.items() if k not in HIPRUNE_MM_KWARG_KEYS
+        }
 
         # Use the text path instead of token path to use the
         # video-specific logic in processing_qwen2_5_vl.py
@@ -1377,16 +1433,39 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
             prompt, mm_data, mm_kwargs, tok_kwargs
         )
 
-        # HiPrune: attach the retention ratio per image so it reaches the
-        # model at encode time (the engine-global EVS pattern does not work
-        # here because the ratio is per-request). The prompt placeholder
-        # count is reduced in _get_prompt_updates with the same count
-        # function the model uses at selection time.
+        # HiPrune: attach the retention ratio and packed method/knob
+        # config per image so they reach the model at encode time (the
+        # engine-global EVS pattern does not work here because they are
+        # per-request). The prompt placeholder count is reduced in
+        # _get_prompt_updates with the same count function the model
+        # uses at selection time.
         if hiprune_ratio is not None and "image_grid_thw" in processed_outputs:
             num_images = len(processed_outputs["image_grid_thw"])
             processed_outputs["hiprune_ratio"] = torch.full(
                 (num_images,), hiprune_ratio, dtype=torch.float32
             )
+            processed_outputs["hiprune_config"] = (
+                pack_hiprune_config(hiprune_kwargs)
+                .unsqueeze(0)
+                .repeat(num_images, 1)
+            )
+            # HiPrune++ / DART: ship the prompt token ids to the model so
+            # it can embed them (LM embedding table) for text-guided
+            # selection (HiPrune++) or text pivots (DART). Always
+            # attached when pruning is requested — an empty row for
+            # methods that don't use the prompt — so field presence is
+            # uniform when a batch mixes methods across requests.
+            # One identical row per image — the mm field machinery is
+            # per-item. Batched fields must stack, and every row comes
+            # from the same request, so lengths always agree.
+            ids: list[int] = []
+            if get_hiprune_method(hiprune_kwargs) in ("hiprune_pp", "dart"):
+                tokenizer = self.info.get_tokenizer()
+                if hiprune_prompt:
+                    ids = tokenizer.encode(hiprune_prompt, add_special_tokens=False)
+            processed_outputs["hiprune_prompt_ids"] = torch.tensor(
+                [ids], dtype=torch.long
+            ).repeat(num_images, 1)
 
         return processed_outputs
 
@@ -1436,11 +1515,44 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
 
             # HiPrune: shrink the image placeholder run to the retained
             # budget. The model keeps exactly this many tokens at encode
-            # time (same count function on both sides).
+            # time (same count function on both sides). HiPrune++ adds
+            # the text-guided tokens on top of the base budget (additive,
+            # per the paper's Algorithm 1); the count never depends on
+            # the prompt content, only on ratio and beta.
             if modality == "image" and hiprune_ratio is not None:
-                num_tokens = hiprune_retained_tokens_count(
-                    num_tokens, hiprune_ratio
-                )
+                method = get_hiprune_method(hf_processor_mm_kwargs)
+                if method == "hiprune_pp":
+                    base, t_sum = hiprune_pp_budget(
+                        num_tokens,
+                        hiprune_ratio,
+                        get_hiprune_pp_beta(hf_processor_mm_kwargs),
+                    )
+                    num_tokens = base + t_sum
+                elif method == "dart":
+                    p_img, p_txt = get_dart_pivots(hf_processor_mm_kwargs)
+                    num_tokens = dart_keep_count(
+                        num_tokens, hiprune_ratio, p_img, p_txt
+                    )
+                elif method == "nprune":
+                    # Grid-shape-aware count (exact lattice, not a
+                    # ratio-derived budget); must match the model's
+                    # nprune_select over t*grid_h rows.
+                    T, H, W = map(int, grid_thw)
+                    ms = image_processor.merge_size
+                    num_tokens = nprune_keep_count(
+                        T * (H // ms),
+                        W // ms,
+                        get_nprune_stride(hf_processor_mm_kwargs),
+                    )
+                elif method == "checkered":
+                    # Exact ceil(N/2), shape-independent — NOT the
+                    # ratio path (round(n*0.5) rounds half-to-even and
+                    # loses a token on odd counts).
+                    num_tokens = checkered_keep_count(num_tokens)
+                else:
+                    num_tokens = hiprune_retained_tokens_count(
+                        num_tokens, hiprune_ratio
+                    )
 
             return [placeholder[modality]] * num_tokens
 
@@ -1537,13 +1649,29 @@ class Qwen2_5_VLForConditionalGeneration(
         llm_pos_ids_list: list = []
         st = 0
 
-        for (
+        # HiPrune: pruned placeholder runs are shrunk in the prompt, so
+        # each feature occupies mm_position.length tokens, not the full
+        # grid product. Advance by the actual run length and emit exactly
+        # that many position columns — otherwise the cursor overshoots and
+        # the next feature's text_len goes negative on multi-image
+        # requests. The per-column values for pruned runs are provisional;
+        # recompute_mrope_positions replaces them once the pruned
+        # embeddings (with their kept spatial positions) are available.
+        # Unpruned runs have length == grid product, so this is identical
+        # to the upstream behavior.
+        run_lengths = [
+            f.mm_position.length
+            for f in sorted(mm_features, key=lambda f: f.mm_position.offset)
+            if f.modality != "prompt_embeds"
+        ]
+
+        for run_length, (
             offset,
             llm_grid_t,
             llm_grid_h,
             llm_grid_w,
             t_factor,
-        ) in self.iter_mm_grid_thw(mm_features):
+        ) in zip(run_lengths, self.iter_mm_grid_thw(mm_features)):
             text_len = offset - st
             st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
             llm_pos_ids_list.append(
@@ -1553,8 +1681,9 @@ class Qwen2_5_VLForConditionalGeneration(
             grid_indices = np.indices((llm_grid_t, llm_grid_h, llm_grid_w))
             if t_factor != 1.0:
                 grid_indices[0] = (grid_indices[0] * t_factor).astype(np.int64)
-            llm_pos_ids_list.append(grid_indices.reshape(3, -1) + text_len + st_idx)
-            st = offset + llm_grid_t * llm_grid_h * llm_grid_w
+            grid_positions = grid_indices.reshape(3, -1)[:, :run_length]
+            llm_pos_ids_list.append(grid_positions + text_len + st_idx)
+            st = offset + run_length
 
         if st < len(input_tokens):
             st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
@@ -1626,6 +1755,8 @@ class Qwen2_5_VLForConditionalGeneration(
         image_embeds = kwargs.pop("image_embeds", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         hiprune_ratio = kwargs.pop("hiprune_ratio", None)
+        hiprune_prompt_ids = kwargs.pop("hiprune_prompt_ids", None)
+        hiprune_config = kwargs.pop("hiprune_config", None)
 
         if pixel_values is None and image_embeds is None:
             return None
@@ -1636,6 +1767,8 @@ class Qwen2_5_VLForConditionalGeneration(
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
                 hiprune_ratio=hiprune_ratio,
+                hiprune_prompt_ids=hiprune_prompt_ids,
+                hiprune_config=hiprune_config,
             )
 
         if image_embeds is not None:
@@ -1688,12 +1821,33 @@ class Qwen2_5_VLForConditionalGeneration(
         self._hiprune_kept_masks: list[torch.Tensor | None] = [None] * num_images
 
         ratios: list[float | None] = [None] * num_images
+        prompt_ids: list[torch.Tensor | None] = [None] * num_images
+        configs: list[HipruneConfig | None] = [None] * num_images
         if image_input["type"] == "pixel_values":
             hp_field = image_input.get("hiprune_ratio")
             if hp_field is not None:
                 for idx in range(num_images):
                     ratio = float(hp_field[idx])
                     ratios[idx] = ratio if ratio < 1.0 else None
+            # HiPrune++ prompt ids, kept per image: a batch can span
+            # multiple requests with different prompts (rows then arrive
+            # as a list of unequal-length tensors instead of a stacked
+            # tensor).
+            pid_field = image_input.get("hiprune_prompt_ids")
+            if pid_field is not None:
+                for idx in range(num_images):
+                    row = pid_field[idx]
+                    if row.numel():
+                        prompt_ids[idx] = row
+            # Packed method/knob config, kept per image: a batch can span
+            # requests with different methods. Missing field (e.g. an
+            # older cached item) falls back to env/defaults in
+            # unpack_hiprune_config.
+            cfg_field = image_input.get("hiprune_config")
+            for idx in range(num_images):
+                if ratios[idx] is not None:
+                    row = cfg_field[idx] if cfg_field is not None else None
+                    configs[idx] = unpack_hiprune_config(row)
 
         if image_input["type"] == "image_embeds":
             image_embeds = image_input["image_embeds"].type(self.visual.dtype)
@@ -1710,7 +1864,7 @@ class Qwen2_5_VLForConditionalGeneration(
                 )
             elif any(r is not None for r in ratios):
                 return self._process_image_input_hiprune(
-                    pixel_values, grid_thw_list, ratios
+                    pixel_values, grid_thw_list, ratios, prompt_ids, configs
                 )
             else:
                 image_embeds = self.visual(pixel_values, grid_thw=grid_thw_list)
@@ -1725,6 +1879,8 @@ class Qwen2_5_VLForConditionalGeneration(
         pixel_values: torch.Tensor,
         grid_thw_list: list[list[int]],
         ratios: list[float | None],
+        prompt_ids: list[torch.Tensor | None] | None = None,
+        configs: list[HipruneConfig | None] | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Encode images one at a time, pruning with HiPrune where requested.
 
@@ -1734,11 +1890,36 @@ class Qwen2_5_VLForConditionalGeneration(
         images — and because the dense score pass has a much higher memory
         cost than the windowed encoder attention.
 
-        For each pruned image, the anchor/buffer/register selection keeps
-        exactly ``compute_retained_tokens_count(num_tokens, ratio)`` merged
-        tokens — the same count the processor used for the placeholder run
-        — and the kept-token mask and metadata are stashed for
+        For each pruned image, the selection (HiPrune's
+        anchor/buffer/register, HyDART's anchor/buffer/diverse with
+        ``HIPRUNE_METHOD=hydart``, or HiPrune++'s
+        anchor/buffer/register/prompt with ``HIPRUNE_METHOD=hiprune_pp``)
+        keeps exactly the token count the processor used for the
+        placeholder run — ``compute_retained_tokens_count(num_tokens,
+        ratio)``, plus the text-guided extra for HiPrune++ — and the
+        kept-token mask and metadata are stashed for
         _postprocess_image_embeds_evs and the API layer respectively.
+
+        HyDART only captures the object layer: the deep-layer register
+        stage is replaced by cosine-similarity MMR over the merged
+        embeddings, so the second dense score pass (the dominant selection
+        cost on large images) is skipped entirely.
+
+        HiPrune++ compares the merged embeddings (already LM-space: the
+        merger projects to the LM hidden size) against the mean LM
+        embedding of the image's ``prompt_ids`` entry (per image, since a
+        batch can span requests with different prompts); a missing/empty
+        prompt falls back to a zero text embedding (arbitrary text picks,
+        count unchanged).
+
+        DART (``HIPRUNE_METHOD=dart``) uses no vision-tower attention at
+        all: the merged embeddings and the LM embeddings of the prompt
+        run through the language model's first K decoder layers (aux
+        pass, see ``vllm/multimodal/dart_scoring.py``) and the layer-K
+        key norms / hidden states drive the official pivot +
+        anti-duplication selection. A missing prompt means no text
+        pivots; the count invariant holds via the top-up rule in
+        ``dart_select``.
         """
         merge_size = self.visual.spatial_merge_size
         object_layer_idx = QWEN2_5_VL_OBJECT_LAYER - 1
@@ -1746,6 +1927,16 @@ class Qwen2_5_VLForConditionalGeneration(
 
         patch_counts = [t * h * w for t, h, w in grid_thw_list]
         pixel_values_per_image = pixel_values.split(patch_counts)
+
+        # HiPrune++: per-image mean LM embedding of the prompt tokens
+        # (one embedding lookup per image — negligible next to the
+        # dense score capture).
+        def _text_embedding_for(idx: int) -> torch.Tensor | None:
+            if prompt_ids is None or prompt_ids[idx] is None:
+                return None
+            ids = prompt_ids[idx].long()
+            embed_tokens = self.language_model.model.embed_tokens
+            return embed_tokens(ids).float().mean(dim=0)
 
         image_embeds_out: list[torch.Tensor] = []
         for idx, (pv, thw, ratio) in enumerate(
@@ -1755,13 +1946,123 @@ class Qwen2_5_VLForConditionalGeneration(
                 image_embeds_out.append(self.visual(pv, grid_thw=[thw]))
                 continue
 
+            # Per-image method dispatch: images are encoded individually
+            # anyway (see docstring), so a batch mixing methods across
+            # requests just takes a different branch per image.
+            cfg = (
+                configs[idx]
+                if configs is not None and configs[idx] is not None
+                else unpack_hiprune_config(None)
+            )
+            method = cfg.method
+
+            # NPrune: pure uniform-lattice sampling — no attention
+            # capture, no scores, no prompt. Plain visual forward.
+            if method == "nprune":
+                embeds = self.visual(pv, grid_thw=[thw])
+                t, h, w = thw
+                grid_h = h // merge_size
+                grid_w = w // merge_size
+                num_tokens = t * grid_h * grid_w
+                assert embeds.shape[0] == num_tokens
+                # Frames stack vertically in raster order, so the
+                # lattice runs over t*grid_h rows (t is 1 for images).
+                kept_idx, kept_mask = nprune_select(
+                    t * grid_h, grid_w, cfg.stride, device=embeds.device
+                )
+                metadata = build_nprune_metadata(
+                    kept_idx, kept_mask, grid_w, grid_h, cfg.stride
+                )
+                image_embeds_out.append(embeds[kept_mask])
+                self._hiprune_kept_masks[idx] = kept_mask
+                self._hiprune_metadata[idx] = metadata
+                continue
+
+            # Checkered: deterministic checkerboard — no attention
+            # capture, no scores, no prompt. Plain visual forward.
+            if method == "checkered":
+                embeds = self.visual(pv, grid_thw=[thw])
+                t, h, w = thw
+                grid_h = h // merge_size
+                grid_w = w // merge_size
+                num_tokens = t * grid_h * grid_w
+                assert embeds.shape[0] == num_tokens
+                # Frames stack vertically in raster order, so the
+                # checkerboard runs over t*grid_h rows (t is 1 for
+                # images).
+                kept_idx, kept_mask = checkered_select(
+                    t * grid_h, grid_w, device=embeds.device
+                )
+                metadata = build_checkered_metadata(
+                    kept_idx, kept_mask, grid_w, grid_h
+                )
+                image_embeds_out.append(embeds[kept_mask])
+                self._hiprune_kept_masks[idx] = kept_mask
+                self._hiprune_metadata[idx] = metadata
+                continue
+
+            if method == "dart":
+                embeds = self.visual(pv, grid_thw=[thw])
+                t, h, w = thw
+                grid_h = h // merge_size
+                grid_w = w // merge_size
+                num_tokens = t * grid_h * grid_w
+                assert embeds.shape[0] == num_tokens
+
+                lm = self.language_model.model
+                pid = prompt_ids[idx] if prompt_ids is not None else None
+                if pid is not None and pid.numel():
+                    text_embeds = lm.embed_tokens(
+                        pid.long().to(embeds.device)
+                    ).to(embeds.dtype)
+                else:
+                    text_embeds = embeds.new_zeros((0, embeds.shape[-1]))
+                seq_embeds = torch.cat([embeds, text_embeds], dim=0)
+                positions = qwen2_5_vl_dart_positions(
+                    (t, h, w),
+                    merge_size,
+                    text_embeds.shape[0],
+                    embeds.device,
+                )
+                dart_layer = get_dart_layer()
+                hidden, key_l1 = dart_prefix_states_llama(
+                    lm.layers, lm.norm, seq_embeds, positions, dart_layer
+                )
+                p_img, p_txt = cfg.pivot_image, cfg.pivot_text
+                img_piv, txt_piv, diverse_idx, kept_mask, pivot_sim = dart_select(
+                    hidden, key_l1, num_tokens, ratio, p_img, p_txt
+                )
+                metadata = build_dart_metadata(
+                    img_piv,
+                    diverse_idx,
+                    kept_mask,
+                    key_l1,
+                    pivot_sim,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    pivot_image=p_img,
+                    pivot_text=p_txt,
+                    num_text_pivots=int(txt_piv.numel()),
+                    dart_layer=dart_layer,
+                )
+                image_embeds_out.append(embeds[kept_mask])
+                self._hiprune_kept_masks[idx] = kept_mask
+                self._hiprune_metadata[idx] = metadata
+                continue
+
+            # HyDART needs only the object-layer scores (its diverse fill
+            # uses embedding similarity, not deep attention).
+            if method == "hydart":
+                capture_layer_idxs: tuple[int, ...] = (object_layer_idx,)
+            else:
+                capture_layer_idxs = (object_layer_idx, deep_layer_idx)
             embeds, scores_by_layer = self.visual.forward_capturing_hiprune_scores(
                 pv,
                 [thw],
-                capture_layer_idxs=(object_layer_idx, deep_layer_idx),
+                capture_layer_idxs=capture_layer_idxs,
             )
             shallow = scores_by_layer[object_layer_idx]
-            deep = scores_by_layer[deep_layer_idx]
 
             t, h, w = thw
             grid_h = h // merge_size
@@ -1769,23 +2070,92 @@ class Qwen2_5_VLForConditionalGeneration(
             num_tokens = t * grid_h * grid_w
             assert embeds.shape[0] == num_tokens == shallow.shape[0]
 
-            anchor_idx, buffer_idx, register_idx, kept_mask = hiprune_select(
-                shallow, deep, num_tokens, grid_w, ratio
-            )
+            if method == "hydart":
+                lambda_seed, lambda_pick = cfg.lambda_seed, cfg.lambda_pick
+                anchor_idx, buffer_idx, diverse_idx, kept_mask, sim_stats = (
+                    hydart_select(
+                        shallow,
+                        embeds,
+                        num_tokens,
+                        grid_w,
+                        ratio,
+                        lambda_seed=lambda_seed,
+                        lambda_pick=lambda_pick,
+                    )
+                )
+                metadata = build_hydart_metadata(
+                    anchor_idx,
+                    buffer_idx,
+                    diverse_idx,
+                    kept_mask,
+                    shallow,
+                    sim_stats,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    object_layer=QWEN2_5_VL_OBJECT_LAYER,
+                    lambda_seed=lambda_seed,
+                    lambda_pick=lambda_pick,
+                )
+            elif method == "hiprune_pp":
+                deep = scores_by_layer[deep_layer_idx]
+                text_emb = _text_embedding_for(idx)
+                if text_emb is None:
+                    text_emb = embeds.new_zeros(
+                        embeds.shape[-1], dtype=torch.float32
+                    )
+                (
+                    anchor_idx,
+                    buffer_idx,
+                    register_idx,
+                    prompt_idx,
+                    kept_mask,
+                    text_similarity,
+                ) = hiprune_pp_select(
+                    shallow,
+                    deep,
+                    embeds,
+                    text_emb,
+                    num_tokens,
+                    grid_w,
+                    ratio,
+                    beta=cfg.beta,
+                )
+                metadata = build_hiprune_pp_metadata(
+                    anchor_idx,
+                    buffer_idx,
+                    register_idx,
+                    prompt_idx,
+                    kept_mask,
+                    shallow,
+                    deep,
+                    text_similarity,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    object_layer=QWEN2_5_VL_OBJECT_LAYER,
+                    beta=cfg.beta,
+                )
+            else:
+                deep = scores_by_layer[deep_layer_idx]
+                anchor_idx, buffer_idx, register_idx, kept_mask = hiprune_select(
+                    shallow, deep, num_tokens, grid_w, ratio
+                )
+                metadata = build_hiprune_metadata(
+                    anchor_idx,
+                    buffer_idx,
+                    register_idx,
+                    kept_mask,
+                    shallow,
+                    deep,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    object_layer=QWEN2_5_VL_OBJECT_LAYER,
+                )
             image_embeds_out.append(embeds[kept_mask])
             self._hiprune_kept_masks[idx] = kept_mask
-            self._hiprune_metadata[idx] = build_hiprune_metadata(
-                anchor_idx,
-                buffer_idx,
-                register_idx,
-                kept_mask,
-                shallow,
-                deep,
-                grid_w,
-                grid_h,
-                ratio,
-                object_layer=QWEN2_5_VL_OBJECT_LAYER,
-            )
+            self._hiprune_metadata[idx] = metadata
 
         return tuple(image_embeds_out)
 

@@ -1,0 +1,38 @@
+{
+  "dataset": "lmms-lab/textvqa (validation)",
+  "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "num_samples": 1000,
+  "seed": 0,
+  "results": [
+    {
+      "ratio": 0.5,
+      "num_samples": 1000,
+      "vqa_accuracy": 0.7816666666666666,
+      "zero_credit": 179,
+      "mean_prompt_tokens": 529.645,
+      "mean_ttft_s": 0.1834355910308659,
+      "median_ttft_s": 0.17171755339950323,
+      "accuracy_pass_seconds": 144.9968316880986
+    },
+    {
+      "ratio": 0.3,
+      "num_samples": 1000,
+      "vqa_accuracy": 0.7196666666666667,
+      "zero_credit": 240,
+      "mean_prompt_tokens": 333.458,
+      "mean_ttft_s": 0.16972763876741132,
+      "median_ttft_s": 0.16350285476073623,
+      "accuracy_pass_seconds": 136.03858576063067
+    },
+    {
+      "ratio": 0.14,
+      "num_samples": 1000,
+      "vqa_accuracy": 0.5873333333333334,
+      "zero_credit": 373,
+      "mean_prompt_tokens": 176.557,
+      "mean_ttft_s": 0.1608328651326398,
+      "median_ttft_s": 0.15876929368823767,
+      "accuracy_pass_seconds": 125.53893380705267
+    }
+  ]
+}

@@ -1,13 +1,10 @@
-"""Render a HiPrune overlay from a vLLM chat response.
+"""Render a HiPrune/HyDART overlay from a vLLM chat response.
 
 Reads the original image and the pruning data returned by the vLLM
-server and draws it over the image: pruned cells are darkened and kept
-cells are outlined by HiPrune category — anchors (red), buffers
-(orange), registers (green).
-
-Each grid cell covers --cell pixels of the (resized) image: 48 for
-Gemma 4 (16 px patches pooled 3x3, the default) and 28 for Qwen2.5-VL
-(14 px patches merged 2x2).
+server and draws it over the image: pruned 48x48 px cells are darkened
+and kept cells are outlined by category — anchors (red), buffers
+(orange), and either registers (green, HiPrune) or diverse tokens
+(blue, HyDART), depending on the `method` in the metadata.
 
 Prefers the `token_pruning_metadata` response field (which carries the
 grid and token categories); falls back to `pruned_token_indices` (kept
@@ -31,7 +28,7 @@ Optional flags enrich the report:
 
 Usage:
     python3 visualize_pruned.py <image> <response.json> <output.png> \
-        [--cell 48] [--baseline baseline.json] [--request request.json] \
+        [--baseline baseline.json] [--request request.json] \
         [--timing timing.json]
 """
 
@@ -42,15 +39,23 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 POOL_K = 3      # Gemma pools 3x3 patches into one soft token
-PATCH = 16      # Gemma ViT patch size in px
-GEMMA_CELL = POOL_K * PATCH  # 48 px of resized image per soft token
-QWEN_CELL = 14 * 2  # Qwen2.5-VL: 14 px patches merged 2x2 -> 28 px per token
+PATCH = 16      # ViT patch size in px
+CELL = POOL_K * PATCH  # 48 px of resized image per soft token
 MAX_SOFT_TOKENS = 280
 
 ANCHOR_COLOR = (255, 60, 60, 255)
 BUFFER_COLOR = (255, 170, 40, 255)
 REGISTER_COLOR = (50, 255, 80, 255)
+DIVERSE_COLOR = (70, 140, 255, 255)
 PRUNED_FILL = (0, 0, 0, 210)
+
+
+def third_category(md: dict) -> tuple[str, list, tuple]:
+    """(name, indices, color) of the non-anchor/buffer kept category:
+    HiPrune registers or HyDART diverse tokens."""
+    if md.get("method") == "hydart" or "diverse" in md:
+        return "diverse", md.get("diverse", []), DIVERSE_COLOR
+    return "registers", md.get("registers", []), REGISTER_COLOR
 
 
 def gemma_grid(width: int, height: int) -> tuple[int, int]:
@@ -59,11 +64,10 @@ def gemma_grid(width: int, height: int) -> tuple[int, int]:
     MAX_SOFT_TOKENS soft tokens (mild aspect flooring)."""
     import math
 
-    cell = GEMMA_CELL
-    scale = math.sqrt(MAX_SOFT_TOKENS * cell * cell / (width * height))
-    scale = min(scale, 1.0) if width * height > MAX_SOFT_TOKENS * cell * cell else scale
-    grid_w = max(1, int(width * scale // cell))
-    grid_h = max(1, int(height * scale // cell))
+    scale = math.sqrt(MAX_SOFT_TOKENS * CELL * CELL / (width * height))
+    scale = min(scale, 1.0) if width * height > MAX_SOFT_TOKENS * CELL * CELL else scale
+    grid_w = max(1, int(width * scale // CELL))
+    grid_h = max(1, int(height * scale // CELL))
     while grid_w * grid_h > MAX_SOFT_TOKENS:
         if grid_w >= grid_h:
             grid_w -= 1
@@ -173,23 +177,34 @@ def write_reports(
         n = md["num_tokens"]
         n_pruned = len(md["pruned"])
         n_kept = n - n_pruned
+        cat_name, cat_idx, _ = third_category(md)
+        method_desc = f"object layer {md['object_layer']}, alpha {md['alpha']}"
+        if md.get("method") == "hydart":
+            method_desc += (
+                f", lambda_seed {md['lambda_seed']}, lambda_pick {md['lambda_pick']}"
+            )
         lines += [
-            f"image {i}",
+            f"image {i}  ({md.get('method', 'hiprune')})",
             f"  grid      : {md['grid'][0]} x {md['grid'][1]}  ({n} soft tokens)",
-            f"  retention : {md['retention']:.4f}  "
-            f"(object layer {md['object_layer']}, alpha {md['alpha']})",
+            f"  retention : {md['retention']:.4f}  ({method_desc})",
             f"  kept      : {n_kept} ({100 * n_kept / n:.1f}%)   "
             f"pruned: {n_pruned} ({100 * n_pruned / n:.1f}%)",
             f"    anchors   : {len(md['anchors'])}  {md['anchors']}",
             f"    buffers   : {len(md['buffers'])}  {md['buffers']}",
-            f"    registers : {len(md['registers'])}",
+            f"    {cat_name:<9} : {len(cat_idx)}",
         ]
-        for layer in ("object_layer", "deep_layer"):
-            ma = md["mean_attention"][layer]
+        for layer, ma in md["mean_attention"].items():
             cells = " | ".join(
                 f"{k} {v:.4g}" for k, v in ma.items() if v is not None
             )
             lines.append(f"  mean attention ({layer.replace('_', ' ')}): {cells}")
+        sim = md.get("similarity")
+        if sim:
+            lines.append(
+                "  cosine similarity: "
+                f"diverse at selection {sim['diverse_at_selection']:.4g} | "
+                f"pruned vs kept {sim['pruned_vs_kept']:.4g}"
+            )
     if timing is not None:
         lines += timing_lines(timing)
     report_path = f"{stem}.report.txt"
@@ -211,11 +226,6 @@ def main() -> None:
     parser.add_argument("--baseline", help="baseline (unpruned) response JSON")
     parser.add_argument("--request", help="request body JSON that was sent")
     parser.add_argument("--timing", help="benchmark.py output JSON")
-    parser.add_argument(
-        "--cell", type=int, default=GEMMA_CELL,
-        help="pixels per grid cell in the overlay: 48 for Gemma 4 "
-        f"(default), {QWEN_CELL} for Qwen2.5-VL",
-    )
     args = parser.parse_args()
 
     image_path, resp_path, out_path = args.image, args.response, args.output
@@ -241,10 +251,11 @@ def main() -> None:
     if metadata is not None:
         grid_w, grid_h = metadata["grid"]
         pruned = metadata["pruned"]
+        cat_name, cat_idx, cat_color = third_category(metadata)
         categories = {
             "anchor": (metadata["anchors"], ANCHOR_COLOR),
             "buffer": (metadata["buffers"], BUFFER_COLOR),
-            "register": (metadata["registers"], REGISTER_COLOR),
+            cat_name: (cat_idx, cat_color),
         }
     else:
         grid_w, grid_h = gemma_grid(*img.size)
@@ -253,12 +264,11 @@ def main() -> None:
         categories = {"kept": (kept, REGISTER_COLOR)}
 
     n_soft = grid_w * grid_h
-    cell = args.cell
-    resized = img.resize((grid_w * cell, grid_h * cell), Image.BICUBIC)
+    resized = img.resize((grid_w * CELL, grid_h * CELL), Image.BICUBIC)
 
     def cell_box(idx: int) -> list[int]:
         r, c = idx // grid_w, idx % grid_w
-        return [c * cell, r * cell, c * cell + cell, r * cell + cell]
+        return [c * CELL, r * CELL, c * CELL + CELL, r * CELL + CELL]
 
     overlay = resized.copy()
     draw = ImageDraw.Draw(overlay, "RGBA")
@@ -277,17 +287,22 @@ def main() -> None:
     d = ImageDraw.Draw(canvas)
     d.text((8, 10), f"original (resized {resized.width}x{resized.height})", fill=(0, 0, 0))
     n_kept = n_soft - len(pruned)
+    method_label = "HiPrune"
+    if metadata is not None and metadata.get("method") == "hydart":
+        method_label = "HyDART"
     d.text(
         (resized.width + gap + 8, 10),
-        f"HiPrune: {len(pruned)}/{n_soft} tokens pruned, {n_kept} kept",
+        f"{method_label}: {len(pruned)}/{n_soft} tokens pruned, {n_kept} kept",
         fill=(0, 0, 0),
     )
     if metadata is not None:
+        cat_name, cat_idx, cat_color = third_category(metadata)
+        cat_color_name = "blue" if cat_name == "diverse" else "green"
         d.text(
             (resized.width + gap + 8, 28),
             f"anchors {len(metadata['anchors'])} (red) | "
             f"buffers {len(metadata['buffers'])} (orange) | "
-            f"registers {len(metadata['registers'])} (green)",
+            f"{cat_name} {len(cat_idx)} ({cat_color_name})",
             fill=(0, 0, 0),
         )
     canvas.save(out_path)
@@ -295,12 +310,15 @@ def main() -> None:
           f"{len(pruned)} pruned, {n_kept} kept -> {out_path}")
     if metadata is not None:
         ma = metadata["mean_attention"]
-        print("mean attention (object layer):",
-              {k: (round(v, 6) if v is not None else None)
-               for k, v in ma["object_layer"].items()})
-        print("mean attention (deep layer)  :",
-              {k: (round(v, 6) if v is not None else None)
-               for k, v in ma["deep_layer"].items()})
+        for layer, scores in ma.items():
+            print(f"mean attention ({layer.replace('_', ' ')}):",
+                  {k: (round(v, 6) if v is not None else None)
+                   for k, v in scores.items()})
+        if metadata.get("similarity"):
+            print("cosine similarity:", {
+                k: round(v, 6) for k, v in metadata["similarity"].items()
+                if v is not None
+            })
 
     for path in write_reports(resp, out_path, baseline, request, timing):
         print(f"wrote {path}")

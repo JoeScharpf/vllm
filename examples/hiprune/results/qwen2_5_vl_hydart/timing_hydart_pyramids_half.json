@@ -1,0 +1,43 @@
+{
+  "prompt": "Describe this image in detail.",
+  "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "max_tokens": 100,
+  "results": [
+    {
+      "ttft_s": 0.2920122845098376,
+      "decode_tok_s": 91.796561148923,
+      "total_s": 1.3706458183005452,
+      "prompt_tokens": 4083,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramids of Giza, an iconic archaeological complex located in Egypt. The pyramids are constructed from large stone blocks and are situated on a flat plain known as the Giza Plateau. The most prominent pyramid in the image is the Great Pyramid of Khufu, also known as the Pyramid of Cheops. This pyramid is the largest of the three and stands at approximately 146.5 meters (481 feet) tall.\n\nTo the left of the",
+      "retention": 1.0
+    },
+    {
+      "ttft_s": 0.8524040104821324,
+      "decode_tok_s": 92.94465948832068,
+      "total_s": 1.9177408711984754,
+      "prompt_tokens": 2055,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramids of Giza, one of the most iconic and ancient structures in the world. The pyramids are located in the Giza Plateau, which is part of the Giza Necropolis in Egypt. The three main pyramids visible in the image are:\n\n1. **Great Pyramid of Giza**: This is the largest of the three pyramids and is the oldest of the three. It was built for Pharaoh Khufu (also known as Cheops)",
+      "retention": 0.5
+    },
+    {
+      "ttft_s": 0.7785280728712678,
+      "decode_tok_s": 93.05153536646694,
+      "total_s": 1.8426339253783226,
+      "prompt_tokens": 1244,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramids of Giza, one of the most iconic and ancient structures in the world. The pyramids are located in the Giza Plateau, which is part of the Giza Necropolis in Egypt. The three main pyramids visible in the image are:\n\n1. **Great Pyramid of Giza**: This is the largest of the three pyramids and is the oldest of the three. It was built for Pharaoh Khufu (also known as Cheops)",
+      "retention": 0.3
+    },
+    {
+      "ttft_s": 0.7262485213577747,
+      "decode_tok_s": 93.22065446349457,
+      "total_s": 1.7883589826524258,
+      "prompt_tokens": 595,
+      "completion_tokens": 100,
+      "answer": "The image depicts the Great Pyramids of Giza, one of the most iconic and ancient structures in the world. The pyramids are located in the Giza Plateau, which is part of the Giza Necropolis in Egypt. The three main pyramids visible in the image are:\n\n1. **Great Pyramid of Giza**: This is the largest of the three pyramids and was built for Pharaoh Khufu (also known as Cheops). It stands at approximately 486",
+      "retention": 0.14
+    }
+  ]
+}

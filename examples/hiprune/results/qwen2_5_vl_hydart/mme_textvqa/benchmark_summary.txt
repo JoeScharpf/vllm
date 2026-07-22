@@ -1,0 +1,21 @@
+MME (full, 2374 questions) | Qwen/Qwen2.5-VL-3B-Instruct
+
+ retention | HiPrune acc  HyDART acc |  HiPrune P  HyDART P |  HiPrune C  HyDART C |  McNemar p
+-----------------------------------------------------------------------------------------------
+  baseline |       0.849           — |     1607.9         — |      618.9         — |          —
+      0.14 |       0.596       0.605 |      984.0    1035.7 |      178.6     176.1 |     0.3898
+             discordant: HiPrune-only correct 234, HyDART-only correct 254
+      0.30 |       0.655       0.676 |     1170.4    1234.6 |      203.2     302.1 |     0.0101
+             discordant: HiPrune-only correct 171, HyDART-only correct 223
+      0.50 |       0.624       0.626 |     1159.9    1185.0 |      317.1     321.8 |     0.8451
+             discordant: HiPrune-only correct 207, HyDART-only correct 212
+
+
+TextVQA (1000 val samples, seed 0) | Qwen/Qwen2.5-VL-3B-Instruct
+
+ retention |  HiPrune   HyDART |  mean diff   95% CI (bootstrap)
+----------------------------------------------------------------
+  baseline |    0.802        — |          —                    —
+      0.14 |    0.587    0.634 |    +0.0470 [+0.0183, +0.0753]
+      0.30 |    0.720    0.740 |    +0.0207 [-0.0000, +0.0417]
+      0.50 |    0.782    0.781 |    -0.0007 [-0.0143, +0.0133]
