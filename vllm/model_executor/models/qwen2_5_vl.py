@@ -78,7 +78,11 @@ from vllm.multimodal.dart_scoring import (
     qwen2_5_vl_dart_positions,
 )
 from vllm.multimodal.hiprune import (
+    HIPRUNE_CONFIG_WIDTH,
     QWEN2_5_VL_OBJECT_LAYER,
+    anchorprune_resolve_kmin,
+    anchorprune_select,
+    build_anchorprune_metadata,
     build_dart_metadata,
     build_checkered_metadata,
     build_hiprune_metadata,
@@ -247,7 +251,7 @@ class Qwen2_5_VLImagePixelInputs(TensorSchema):
     # span requests with different methods.
     hiprune_config: Annotated[
         torch.Tensor | None,
-        TensorShape("ni", 7),
+        TensorShape("ni", HIPRUNE_CONFIG_WIDTH),
     ] = None
 
 
@@ -1459,7 +1463,11 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
             # per-item. Batched fields must stack, and every row comes
             # from the same request, so lengths always agree.
             ids: list[int] = []
-            if get_hiprune_method(hiprune_kwargs) in ("hiprune_pp", "dart"):
+            if get_hiprune_method(hiprune_kwargs) in (
+                "hiprune_pp",
+                "dart",
+                "anchorprune",
+            ):
                 tokenizer = self.info.get_tokenizer()
                 if hiprune_prompt:
                     ids = tokenizer.encode(hiprune_prompt, add_special_tokens=False)
@@ -1995,6 +2003,70 @@ class Qwen2_5_VLForConditionalGeneration(
                 )
                 metadata = build_checkered_metadata(
                     kept_idx, kept_mask, grid_w, grid_h
+                )
+                image_embeds_out.append(embeds[kept_mask])
+                self._hiprune_kept_masks[idx] = kept_mask
+                self._hiprune_metadata[idx] = metadata
+                continue
+
+            # AnchorPrune: relevance-anchored contextual expansion
+            # (prompt-aware). Importance prior = received attention
+            # mass at the LAST full-attention vision block (the
+            # official layer choice); relevance and novelty run in LM
+            # space over the merged embeds (the official Qwen signals).
+            if method == "anchorprune":
+                importance_layer_idx = max(self.visual.fullatt_block_indexes)
+                embeds, scores_by_layer = (
+                    self.visual.forward_capturing_hiprune_scores(
+                        pv,
+                        [thw],
+                        capture_layer_idxs=(importance_layer_idx,),
+                    )
+                )
+                importance = scores_by_layer[importance_layer_idx]
+                t, h, w = thw
+                grid_h = h // merge_size
+                grid_w = w // merge_size
+                num_tokens = t * grid_h * grid_w
+                assert embeds.shape[0] == num_tokens == importance.shape[0]
+
+                lm = self.language_model.model
+                pid = prompt_ids[idx] if prompt_ids is not None else None
+                if pid is not None and pid.numel():
+                    prompt_embeds = lm.embed_tokens(
+                        pid.long().to(embeds.device)
+                    ).float()
+                else:
+                    prompt_embeds = None
+                # Same count function as the processor's placeholder
+                # sizing (generic ratio path) — the selection keeps
+                # exactly this many tokens, prompt or no prompt.
+                k_total = hiprune_retained_tokens_count(num_tokens, ratio)
+                kept_idx, kept_mask, anchor_idx, expansion_idx = (
+                    anchorprune_select(
+                        embeds,
+                        importance,
+                        prompt_embeds,
+                        k_total,
+                        anchor_kmin=cfg.anchor_kmin,
+                        tau=cfg.tau,
+                    )
+                )
+                metadata = build_anchorprune_metadata(
+                    anchor_idx,
+                    expansion_idx,
+                    kept_mask,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    anchor_kmin_used=anchorprune_resolve_kmin(
+                        k_total, cfg.anchor_kmin
+                    ),
+                    tau=cfg.tau,
+                    num_prompt_tokens=(
+                        0 if prompt_embeds is None
+                        else int(prompt_embeds.shape[0])
+                    ),
                 )
                 image_embeds_out.append(embeds[kept_mask])
                 self._hiprune_kept_masks[idx] = kept_mask

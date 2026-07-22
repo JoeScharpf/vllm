@@ -391,9 +391,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=None,
         description=(
             "Selection method for token_pruning: 'hiprune' (default), "
-            "'hydart', 'hiprune_pp', 'dart', 'nprune' or 'checkered'. "
-            "Per-request — the same running server can serve different "
-            "methods. Shorthand for "
+            "'hydart', 'hiprune_pp', 'dart', 'nprune', 'checkered' or "
+            "'anchorprune'. Per-request — the same running server can "
+            "serve different methods. Shorthand for "
             "mm_processor_kwargs={'hiprune_method': ...}. Omitted: the "
             "server's HIPRUNE_METHOD env var (default 'hiprune')."
         ),
@@ -403,9 +403,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description=(
             "Per-request pruning knobs: lambda_seed / lambda_pick "
             "(HyDART), beta (HiPrune++), pivot_image / pivot_text "
-            "(DART), stride (NPrune). Unknown keys are rejected. Each "
-            "maps onto the corresponding hiprune_* mm-processor kwarg; "
-            "omitted knobs fall back to the server env / paper defaults."
+            "(DART), stride (NPrune), k_min / tau (AnchorPrune). "
+            "Unknown keys are rejected. Each maps onto the "
+            "corresponding hiprune_* mm-processor kwarg; omitted knobs "
+            "fall back to the server env / paper defaults."
         ),
     )
     structured_outputs: StructuredOutputsParams | None = Field(
@@ -1032,6 +1033,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "pivot_image": "hiprune_pivot_image",
                     "pivot_text": "hiprune_pivot_text",
                     "stride": "hiprune_stride",
+                    "k_min": "hiprune_anchor_kmin",
+                    "tau": "hiprune_tau",
                 }
                 unknown = set(self.token_pruning_params) - set(param_to_mm_key)
                 if unknown:
@@ -1048,7 +1051,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
             # Validates the method (per-request or env) and gates the
             # prompt attach on the *request's* effective method.
-            if get_hiprune_method(mm_kwargs) in ("hiprune_pp", "dart"):
+            if get_hiprune_method(mm_kwargs) in (
+                "hiprune_pp",
+                "dart",
+                "anchorprune",
+            ):
                 prompt = self._extract_latest_user_text()
                 if prompt:
                     mm_kwargs["hiprune_prompt"] = prompt

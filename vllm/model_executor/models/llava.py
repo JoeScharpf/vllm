@@ -29,7 +29,11 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import BaseMultiModalProcessorCache
 from vllm.multimodal.dart_scoring import dart_prefix_states_llama
 from vllm.multimodal.hiprune import (
+    HIPRUNE_CONFIG_WIDTH,
     LLAVA_OBJECT_LAYER,
+    anchorprune_resolve_kmin,
+    anchorprune_select,
+    build_anchorprune_metadata,
     build_dart_metadata,
     build_checkered_metadata,
     build_hiprune_metadata,
@@ -147,7 +151,7 @@ class LlavaImagePixelInputs(TensorSchema):
     # span requests with different methods.
     hiprune_config: Annotated[
         torch.Tensor | None,
-        TensorShape("bn", 7),
+        TensorShape("bn", HIPRUNE_CONFIG_WIDTH),
     ] = None
 
 
@@ -436,7 +440,11 @@ class LlavaMultiModalProcessor(BaseLlavaMultiModalProcessor[LlavaProcessingInfo]
             # identical row per image — the mm field machinery is
             # per-item.
             ids: list[int] = []
-            if get_hiprune_method(hiprune_kwargs) in ("hiprune_pp", "dart"):
+            if get_hiprune_method(hiprune_kwargs) in (
+                "hiprune_pp",
+                "dart",
+                "anchorprune",
+            ):
                 tokenizer = self.info.get_tokenizer()
                 if hiprune_prompt:
                     ids = tokenizer.encode(hiprune_prompt, add_special_tokens=False)
@@ -1026,6 +1034,69 @@ class LlavaForConditionalGeneration(
                 )
                 metadata = build_checkered_metadata(
                     kept_idx, kept_mask, grid_w, grid_h
+                )
+                image_embeds_out.append(embeds[kept_mask])
+                self._hiprune_metadata[idx] = metadata
+                continue
+
+            # AnchorPrune: relevance-anchored contextual expansion
+            # (prompt-aware). Importance prior = received attention
+            # mass at the deepest loaded CLIP layer (the paper's
+            # layer -2; vLLM loads CLIP only up to the feature-select
+            # layer). Relevance and novelty run in LM space over the
+            # projected embeds — the official Qwen adapter's signal,
+            # applied here instead of the paper's extra CLIP text tower.
+            if method == "anchorprune":
+                features, scores_by_layer = (
+                    tower.forward_capturing_hiprune_scores(
+                        pv,
+                        capture_layer_idxs=(deep_layer_idx,),
+                        feature_select_strategy=strategy,
+                    )
+                )
+                embeds = self.multi_modal_projector(features)[0]
+                assert embeds.shape[0] == num_tokens
+                # Per-key scores cover the full CLIP sequence; drop the
+                # CLS key (index 0) to align with the 24x24 patches.
+                importance = scores_by_layer[deep_layer_idx][1:]
+                assert importance.shape[0] == num_tokens
+
+                lm = self.language_model.model
+                pid = prompt_ids[idx] if prompt_ids is not None else None
+                if pid is not None and pid.numel():
+                    prompt_embeds = lm.embed_tokens(
+                        pid.long().to(embeds.device)
+                    ).float()
+                else:
+                    prompt_embeds = None
+                # Same count function as the processor's placeholder
+                # sizing (generic ratio path).
+                k_total = hiprune_retained_tokens_count(num_tokens, ratio)
+                kept_idx, kept_mask, anchor_idx, expansion_idx = (
+                    anchorprune_select(
+                        embeds,
+                        importance,
+                        prompt_embeds,
+                        k_total,
+                        anchor_kmin=cfg.anchor_kmin,
+                        tau=cfg.tau,
+                    )
+                )
+                metadata = build_anchorprune_metadata(
+                    anchor_idx,
+                    expansion_idx,
+                    kept_mask,
+                    grid_w,
+                    grid_h,
+                    ratio,
+                    anchor_kmin_used=anchorprune_resolve_kmin(
+                        k_total, cfg.anchor_kmin
+                    ),
+                    tau=cfg.tau,
+                    num_prompt_tokens=(
+                        0 if prompt_embeds is None
+                        else int(prompt_embeds.shape[0])
+                    ),
                 )
                 image_embeds_out.append(embeds[kept_mask])
                 self._hiprune_metadata[idx] = metadata
