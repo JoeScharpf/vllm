@@ -403,10 +403,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description=(
             "Per-request pruning knobs: lambda_seed / lambda_pick "
             "(HyDART), beta (HiPrune++), pivot_image / pivot_text "
-            "(DART), stride (NPrune), k_min / tau (AnchorPrune). "
-            "Unknown keys are rejected. Each maps onto the "
-            "corresponding hiprune_* mm-processor kwarg; omitted knobs "
-            "fall back to the server env / paper defaults."
+            "(DART), stride (NPrune), k_min / tau (AnchorPrune), "
+            "return_vision_attention (1.0 = always attach object-layer "
+            "scores for heatmap UI; default off). Unknown keys are "
+            "rejected. Each maps onto the corresponding hiprune_* "
+            "mm-processor kwarg; omitted knobs fall back to the server "
+            "env / paper defaults."
         ),
     )
     structured_outputs: StructuredOutputsParams | None = Field(
@@ -1035,6 +1037,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "stride": "hiprune_stride",
                     "k_min": "hiprune_anchor_kmin",
                     "tau": "hiprune_tau",
+                    "return_vision_attention": "hiprune_return_vision_attention",
                 }
                 unknown = set(self.token_pruning_params) - set(param_to_mm_key)
                 if unknown:

@@ -33,6 +33,7 @@ from vllm.multimodal.hiprune import (
     LLAVA_OBJECT_LAYER,
     anchorprune_resolve_kmin,
     anchorprune_select,
+    attach_object_layer_scores,
     build_anchorprune_metadata,
     build_dart_metadata,
     build_checkered_metadata,
@@ -1007,33 +1008,62 @@ class LlavaForConditionalGeneration(
             )
             method = cfg.method
 
-            # NPrune: pure uniform-lattice sampling — no attention
-            # capture, no scores, no prompt. Plain tower forward.
+            # NPrune: pure uniform-lattice sampling. Plain tower forward
+            # unless return_vision_attention requests object-layer scores
+            # for the visualizer heatmap.
             if method == "nprune":
-                features = self._image_pixels_to_features(tower, pv)
+                object_scores = None
+                if cfg.return_vision_attention:
+                    features, scores_by_layer = (
+                        tower.forward_capturing_hiprune_scores(
+                            pv,
+                            capture_layer_idxs=(object_layer_idx,),
+                            feature_select_strategy=strategy,
+                        )
+                    )
+                    object_scores = scores_by_layer[object_layer_idx][1:]
+                else:
+                    features = self._image_pixels_to_features(tower, pv)
                 embeds = self.multi_modal_projector(features)[0]
                 assert embeds.shape[0] == num_tokens
                 kept_idx, kept_mask = nprune_select(
                     grid_h, grid_w, cfg.stride, device=embeds.device
                 )
-                metadata = build_nprune_metadata(
-                    kept_idx, kept_mask, grid_w, grid_h, cfg.stride
+                metadata = attach_object_layer_scores(
+                    build_nprune_metadata(
+                        kept_idx, kept_mask, grid_w, grid_h, cfg.stride
+                    ),
+                    object_scores,
                 )
                 image_embeds_out.append(embeds[kept_mask])
                 self._hiprune_metadata[idx] = metadata
                 continue
 
-            # Checkered: deterministic checkerboard — no attention
-            # capture, no scores, no prompt. Plain tower forward.
+            # Checkered: deterministic checkerboard. Plain tower forward
+            # unless return_vision_attention requests object-layer scores.
             if method == "checkered":
-                features = self._image_pixels_to_features(tower, pv)
+                object_scores = None
+                if cfg.return_vision_attention:
+                    features, scores_by_layer = (
+                        tower.forward_capturing_hiprune_scores(
+                            pv,
+                            capture_layer_idxs=(object_layer_idx,),
+                            feature_select_strategy=strategy,
+                        )
+                    )
+                    object_scores = scores_by_layer[object_layer_idx][1:]
+                else:
+                    features = self._image_pixels_to_features(tower, pv)
                 embeds = self.multi_modal_projector(features)[0]
                 assert embeds.shape[0] == num_tokens
                 kept_idx, kept_mask = checkered_select(
                     grid_h, grid_w, device=embeds.device
                 )
-                metadata = build_checkered_metadata(
-                    kept_idx, kept_mask, grid_w, grid_h
+                metadata = attach_object_layer_scores(
+                    build_checkered_metadata(
+                        kept_idx, kept_mask, grid_w, grid_h
+                    ),
+                    object_scores,
                 )
                 image_embeds_out.append(embeds[kept_mask])
                 self._hiprune_metadata[idx] = metadata
@@ -1047,10 +1077,14 @@ class LlavaForConditionalGeneration(
             # projected embeds — the official Qwen adapter's signal,
             # applied here instead of the paper's extra CLIP text tower.
             if method == "anchorprune":
+                if cfg.return_vision_attention:
+                    capture_layer_idxs = (object_layer_idx, deep_layer_idx)
+                else:
+                    capture_layer_idxs = (deep_layer_idx,)
                 features, scores_by_layer = (
                     tower.forward_capturing_hiprune_scores(
                         pv,
-                        capture_layer_idxs=(deep_layer_idx,),
+                        capture_layer_idxs=capture_layer_idxs,
                         feature_select_strategy=strategy,
                     )
                 )
@@ -1060,6 +1094,11 @@ class LlavaForConditionalGeneration(
                 # CLS key (index 0) to align with the 24x24 patches.
                 importance = scores_by_layer[deep_layer_idx][1:]
                 assert importance.shape[0] == num_tokens
+                object_scores = (
+                    scores_by_layer[object_layer_idx][1:]
+                    if cfg.return_vision_attention
+                    else None
+                )
 
                 lm = self.language_model.model
                 pid = prompt_ids[idx] if prompt_ids is not None else None
@@ -1082,28 +1121,42 @@ class LlavaForConditionalGeneration(
                         tau=cfg.tau,
                     )
                 )
-                metadata = build_anchorprune_metadata(
-                    anchor_idx,
-                    expansion_idx,
-                    kept_mask,
-                    grid_w,
-                    grid_h,
-                    ratio,
-                    anchor_kmin_used=anchorprune_resolve_kmin(
-                        k_total, cfg.anchor_kmin
+                metadata = attach_object_layer_scores(
+                    build_anchorprune_metadata(
+                        anchor_idx,
+                        expansion_idx,
+                        kept_mask,
+                        grid_w,
+                        grid_h,
+                        ratio,
+                        anchor_kmin_used=anchorprune_resolve_kmin(
+                            k_total, cfg.anchor_kmin
+                        ),
+                        tau=cfg.tau,
+                        num_prompt_tokens=(
+                            0 if prompt_embeds is None
+                            else int(prompt_embeds.shape[0])
+                        ),
                     ),
-                    tau=cfg.tau,
-                    num_prompt_tokens=(
-                        0 if prompt_embeds is None
-                        else int(prompt_embeds.shape[0])
-                    ),
+                    object_scores,
                 )
                 image_embeds_out.append(embeds[kept_mask])
                 self._hiprune_metadata[idx] = metadata
                 continue
 
             if method == "dart":
-                features = self._image_pixels_to_features(tower, pv)
+                object_scores = None
+                if cfg.return_vision_attention:
+                    features, scores_by_layer = (
+                        tower.forward_capturing_hiprune_scores(
+                            pv,
+                            capture_layer_idxs=(object_layer_idx,),
+                            feature_select_strategy=strategy,
+                        )
+                    )
+                    object_scores = scores_by_layer[object_layer_idx][1:]
+                else:
+                    features = self._image_pixels_to_features(tower, pv)
                 embeds = self.multi_modal_projector(features)[0]
                 assert embeds.shape[0] == num_tokens
 
@@ -1127,19 +1180,22 @@ class LlavaForConditionalGeneration(
                 img_piv, txt_piv, diverse_idx, kept_mask, pivot_sim = (
                     dart_select(hidden, key_l1, num_tokens, ratio, p_img, p_txt)
                 )
-                metadata = build_dart_metadata(
-                    img_piv,
-                    diverse_idx,
-                    kept_mask,
-                    key_l1,
-                    pivot_sim,
-                    grid_w,
-                    grid_h,
-                    ratio,
-                    pivot_image=p_img,
-                    pivot_text=p_txt,
-                    num_text_pivots=int(txt_piv.numel()),
-                    dart_layer=dart_layer,
+                metadata = attach_object_layer_scores(
+                    build_dart_metadata(
+                        img_piv,
+                        diverse_idx,
+                        kept_mask,
+                        key_l1,
+                        pivot_sim,
+                        grid_w,
+                        grid_h,
+                        ratio,
+                        pivot_image=p_img,
+                        pivot_text=p_txt,
+                        num_text_pivots=int(txt_piv.numel()),
+                        dart_layer=dart_layer,
+                    ),
+                    object_scores,
                 )
                 image_embeds_out.append(embeds[kept_mask])
                 self._hiprune_metadata[idx] = metadata
