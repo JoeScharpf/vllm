@@ -1038,6 +1038,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "k_min": "hiprune_anchor_kmin",
                     "tau": "hiprune_tau",
                     "return_vision_attention": "hiprune_return_vision_attention",
+                    "random_seed": "hiprune_random_seed",
                 }
                 unknown = set(self.token_pruning_params) - set(param_to_mm_key)
                 if unknown:
