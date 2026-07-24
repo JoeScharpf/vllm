@@ -134,7 +134,7 @@ def get_hiprune_method(merged_kwargs: Mapping[str, object] | None = None) -> str
     field), falling back to the ``HIPRUNE_METHOD`` env var so
     env-configured servers and scripts keep working. One of ``hiprune``
     (default), ``hydart``, ``hiprune_pp``, ``dart``, ``nprune``,
-    ``checkered`` or ``anchorprune``.
+    ``checkered``, ``anchorprune`` or ``random``.
     """
     val = merged_kwargs.get("hiprune_method") if merged_kwargs else None
     if val is None:
@@ -148,10 +148,12 @@ def get_hiprune_method(merged_kwargs: Mapping[str, object] | None = None) -> str
         "nprune",
         "checkered",
         "anchorprune",
+        "random",
     ):
         raise ValueError(
             "hiprune method must be 'hiprune', 'hydart', 'hiprune_pp', "
-            f"'dart', 'nprune', 'checkered' or 'anchorprune', got {method!r}"
+            "'dart', 'nprune', 'checkered', 'anchorprune' or 'random', "
+            f"got {method!r}"
         )
     return method
 
@@ -313,6 +315,7 @@ HIPRUNE_METHOD_IDS: dict[str, int] = {
     "nprune": 4,
     "checkered": 5,
     "anchorprune": 6,
+    "random": 7,
 }
 _HIPRUNE_ID_METHODS = {v: k for k, v in HIPRUNE_METHOD_IDS.items()}
 
@@ -424,19 +427,30 @@ def unpack_hiprune_config(row: torch.Tensor | None) -> HipruneConfig:
 def attach_object_layer_scores(
     metadata: dict[str, object],
     shallow_scores: torch.Tensor | None,
+    vision_layers: list[list[float]] | None = None,
+    vision_layer_object_idx: int | None = None,
 ) -> dict[str, object]:
-    """Attach method-independent object-layer scores for the heatmap UI.
+    """Attach method-independent vision attention scores for the heatmap UI.
 
-    No-op when ``shallow_scores`` is None. Merges into an existing
+    Always writes ``scores.object_layer`` when ``shallow_scores`` is set
+    (backcompat with the single-layer heatmap). When ``vision_layers`` is
+    provided (Gemma visualizer path), also writes the full early→late
+    stack plus the 0-based object-layer index for the slider default.
+    No-op when both score inputs are None. Merges into an existing
     ``scores`` dict (e.g. DART already has ``key_norm``).
     """
-    if shallow_scores is None:
+    if shallow_scores is None and vision_layers is None:
         return metadata
     scores = metadata.get("scores")
     if not isinstance(scores, dict):
         scores = {}
         metadata["scores"] = scores
-    scores["object_layer"] = shallow_scores.float().tolist()
+    if shallow_scores is not None:
+        scores["object_layer"] = shallow_scores.float().tolist()
+    if vision_layers is not None:
+        scores["vision_layers"] = vision_layers
+        if vision_layer_object_idx is not None:
+            scores["vision_layer_object_idx"] = int(vision_layer_object_idx)
     return metadata
 
 
@@ -633,6 +647,57 @@ def checkered_select(
     kept_mask = (((row_grid + col_grid) % 2) == 0).reshape(-1)
     kept_idx = kept_mask.nonzero(as_tuple=True)[0]
     assert int(kept_mask.sum()) == checkered_keep_count(grid_h * grid_w)
+    return kept_idx, kept_mask
+
+
+# Fixed seed so the same grid + retention always keeps the same patches —
+# required for a visualizer demo where re-runs must be comparable.
+RANDOM_PRUNE_SEED = 0
+
+
+def random_select(
+    grid_h: int,
+    grid_w: int,
+    keep_count: int,
+    device: torch.device | str | None = None,
+    seed: int = RANDOM_PRUNE_SEED,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Random: keep a fixed-seed random subset of soft tokens.
+
+    Content- and prompt-free. Keep count is the same
+    :func:`compute_retained_tokens_count` budget the ratio path uses for
+    HiPrune, so Random is a fair naive baseline at a given retention.
+
+    The generator is always CPU-backed so the mask is identical across
+    CUDA / CPU hosts for the same ``(grid_h, grid_w, keep_count, seed)``.
+
+    Args:
+        grid_h / grid_w: soft-token grid shape (raster order, row-major).
+        keep_count: number of tokens to keep (clamped to ``[0, H*W]``).
+        device: device for the returned tensors.
+        seed: RNG seed (default :data:`RANDOM_PRUNE_SEED`).
+
+    Returns:
+        ``(kept_idx, kept_mask)`` over ``grid_h * grid_w`` raster-order
+        soft tokens; ``kept_idx`` is ascending.
+    """
+    if grid_h <= 0 or grid_w <= 0:
+        raise ValueError(
+            f"grid dims must be positive, got {grid_h}x{grid_w}"
+        )
+    num_tokens = grid_h * grid_w
+    keep_count = min(max(0, int(keep_count)), num_tokens)
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    perm = torch.randperm(num_tokens, generator=gen)
+    kept_idx = perm[:keep_count].sort().values
+    if device is not None:
+        kept_idx = kept_idx.to(device)
+    kept_mask = torch.zeros(
+        num_tokens, dtype=torch.bool, device=kept_idx.device
+    )
+    kept_mask[kept_idx] = True
+    assert int(kept_mask.sum()) == keep_count
     return kept_idx, kept_mask
 
 
@@ -1665,6 +1730,32 @@ def build_checkered_metadata(
         "grid": [grid_w, grid_h],
         "num_tokens": num_tokens,
         "retention": int(kept_idx.numel()) / num_tokens,
+        "pruned": pruned_idx.tolist(),
+        "uniform": kept_idx.tolist(),
+    }
+
+
+def build_random_metadata(
+    kept_idx: torch.Tensor,
+    kept_mask: torch.Tensor,
+    grid_w: int,
+    grid_h: int,
+    seed: int = RANDOM_PRUNE_SEED,
+) -> dict[str, object]:
+    """JSON-safe per-image Random metadata for API reporting.
+
+    Random has no scores; kept indices travel under ``uniform`` so the
+    visualizer's existing single-category overlay renders them. ``seed``
+    is reported so a demo can show that the mask is deterministic.
+    """
+    num_tokens = int(kept_mask.shape[0])
+    pruned_idx = (~kept_mask).nonzero(as_tuple=True)[0]
+    return {
+        "method": "random",
+        "grid": [grid_w, grid_h],
+        "num_tokens": num_tokens,
+        "retention": int(kept_idx.numel()) / num_tokens if num_tokens else 0.0,
+        "seed": seed,
         "pruned": pruned_idx.tolist(),
         "uniform": kept_idx.tolist(),
     }
