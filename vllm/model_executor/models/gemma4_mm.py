@@ -2074,9 +2074,10 @@ class Gemma4ForConditionalGeneration(
                     ),
                 )
             elif ratio is not None and method == "random":
-                # Random: fixed-seed subset at the ratio budget — no
+                # Random: seeded subset at the ratio budget — no
                 # attention, no LM-space projection, no prompt. Same
-                # soft-token sequence the other methods prune.
+                # soft-token sequence the other methods prune. The seed
+                # is per-request so a caller can resample the mask.
                 _, grid_w, grid_h, _ = compute_soft_token_grid(
                     pixel_position_ids[orig_idx], pooling_k
                 )
@@ -2091,11 +2092,12 @@ class Gemma4ForConditionalGeneration(
                     grid_w,
                     keep_count,
                     device=valid_states.device,
+                    seed=cfg.random_seed,
                 )
                 valid_states = valid_states[kept_mask]
                 hiprune_metadata[orig_idx] = attach_object_layer_scores(
                     build_random_metadata(
-                        kept_idx, kept_mask, grid_w, grid_h
+                        kept_idx, kept_mask, grid_w, grid_h, cfg.random_seed
                     ),
                     (
                         hiprune_scores_map[orig_idx][0]

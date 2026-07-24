@@ -321,8 +321,8 @@ _HIPRUNE_ID_METHODS = {v: k for k, v in HIPRUNE_METHOD_IDS.items()}
 
 # Row layout of the packed config: (method_id, lambda_seed, lambda_pick,
 # beta, pivot_image, pivot_text, stride, anchor_kmin, tau,
-# return_vision_attention).
-HIPRUNE_CONFIG_WIDTH = 10
+# return_vision_attention, random_seed).
+HIPRUNE_CONFIG_WIDTH = 11
 
 
 @dataclass(frozen=True)
@@ -342,6 +342,10 @@ class HipruneConfig:
     # capture object-layer scores for the visualizer heatmap. Default
     # False so TTFT/eval benches stay cheap for nprune/checkered/dart.
     return_vision_attention: bool = False
+    # RNG seed for the ``random`` method. Per-request so a caller can
+    # resample the same image/ratio (a new seed is also a new mm-cache
+    # key, so the mask is genuinely recomputed).
+    random_seed: int = 0
 
 
 def get_return_vision_attention(
@@ -362,6 +366,19 @@ def get_return_vision_attention(
     return bool(float(val))  # type: ignore[arg-type]
 
 
+def get_random_seed(merged_kwargs: Mapping[str, object] | None = None) -> int:
+    """RNG seed for the ``random`` method.
+
+    Per-request ``hiprune_random_seed`` mm kwarg (mapped from
+    ``token_pruning_params.random_seed``), else
+    :data:`RANDOM_PRUNE_SEED` so repeat runs stay reproducible.
+    """
+    val = merged_kwargs.get("hiprune_random_seed") if merged_kwargs else None
+    if val is None:
+        return RANDOM_PRUNE_SEED
+    return int(float(val))  # type: ignore[arg-type]
+
+
 def pack_hiprune_config(
     merged_kwargs: Mapping[str, object] | None = None,
 ) -> torch.Tensor:
@@ -380,6 +397,7 @@ def pack_hiprune_config(
     anchor_kmin = get_anchorprune_kmin(merged_kwargs)
     tau = get_anchorprune_tau(merged_kwargs)
     return_attn = get_return_vision_attention(merged_kwargs)
+    random_seed = get_random_seed(merged_kwargs)
     return torch.tensor(
         [
             float(HIPRUNE_METHOD_IDS[method]),
@@ -392,6 +410,7 @@ def pack_hiprune_config(
             float(anchor_kmin),
             tau,
             1.0 if return_attn else 0.0,
+            float(random_seed),
         ],
         dtype=torch.float32,
     )
@@ -421,6 +440,7 @@ def unpack_hiprune_config(row: torch.Tensor | None) -> HipruneConfig:
         anchor_kmin=int(round(vals[7])),
         tau=vals[8],
         return_vision_attention=bool(round(vals[9])),
+        random_seed=int(round(vals[10])),
     )
 
 
