@@ -59,6 +59,7 @@ from vllm.multimodal.hiprune import (
     build_hiprune_pp_metadata,
     build_hydart_metadata,
     build_nprune_metadata,
+    build_random_metadata,
     checkered_keep_count,
     checkered_select,
     compute_hiprune_pp_budget,
@@ -78,6 +79,7 @@ from vllm.multimodal.hiprune import (
     hydart_select,
     nprune_keep_count,
     nprune_select,
+    random_select,
     pack_hiprune_config,
     unpack_hiprune_config,
     HIPRUNE_MM_KWARG_KEYS,
@@ -1750,7 +1752,7 @@ class Gemma4ForConditionalGeneration(
                     if ratios[chunk_items[0][0]] is not None
                     else None
                 )
-                score_only_methods = ("dart", "nprune", "checkered")
+                score_only_methods = ("dart", "nprune", "checkered", "random")
                 chunk_needs_pruning = pruned_cfg is not None and (
                     pruned_cfg.method not in score_only_methods
                     or pruned_cfg.return_vision_attention
@@ -2052,6 +2054,47 @@ class Gemma4ForConditionalGeneration(
                 valid_states = valid_states[kept_mask]
                 hiprune_metadata[orig_idx] = attach_object_layer_scores(
                     build_checkered_metadata(
+                        kept_idx, kept_mask, grid_w, grid_h
+                    ),
+                    (
+                        hiprune_scores_map[orig_idx][0]
+                        if orig_idx in hiprune_scores_map
+                        else None
+                    ),
+                    vision_layers=(
+                        hiprune_scores_map[orig_idx][4]
+                        if orig_idx in hiprune_scores_map
+                        else None
+                    ),
+                    vision_layer_object_idx=(
+                        GEMMA4_OBJECT_LAYER - 1
+                        if orig_idx in hiprune_scores_map
+                        and hiprune_scores_map[orig_idx][4] is not None
+                        else None
+                    ),
+                )
+            elif ratio is not None and method == "random":
+                # Random: fixed-seed subset at the ratio budget — no
+                # attention, no LM-space projection, no prompt. Same
+                # soft-token sequence the other methods prune.
+                _, grid_w, grid_h, _ = compute_soft_token_grid(
+                    pixel_position_ids[orig_idx], pooling_k
+                )
+                num_soft = valid_states.shape[0]
+                assert grid_w * grid_h == num_soft, (
+                    f"soft-token grid {grid_w}x{grid_h} != pooled "
+                    f"soft-token count {num_soft}"
+                )
+                keep_count = compute_retained_tokens_count(num_soft, ratio)
+                kept_idx, kept_mask = random_select(
+                    grid_h,
+                    grid_w,
+                    keep_count,
+                    device=valid_states.device,
+                )
+                valid_states = valid_states[kept_mask]
+                hiprune_metadata[orig_idx] = attach_object_layer_scores(
+                    build_random_metadata(
                         kept_idx, kept_mask, grid_w, grid_h
                     ),
                     (
