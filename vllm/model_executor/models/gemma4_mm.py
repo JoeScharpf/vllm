@@ -1681,10 +1681,19 @@ class Gemma4ForConditionalGeneration(
         # free memory per bucket because the previous bucket's encoder
         # pass has already allocated activations we should account for.
         last_hidden_states_map: dict[int, torch.Tensor] = {}
-        # orig_idx -> (shallow_scores, deep_scores or None, grid_w, grid_h);
-        # deep is None under HyDART, which captures only the object layer.
+        # orig_idx -> (shallow, deep|None, grid_w, grid_h, vision_layers|None).
+        # vision_layers is the full early→late soft-token attention stack
+        # when return_vision_attention is set (heatmap slider); otherwise
+        # None. deep is None under HyDART / score-only heatmap capture.
         hiprune_scores_map: dict[
-            int, tuple[torch.Tensor, torch.Tensor | None, int, int]
+            int,
+            tuple[
+                torch.Tensor,
+                torch.Tensor | None,
+                int,
+                int,
+                list[list[float]] | None,
+            ],
         ] = {}
         for patches, items in buckets.items():
             free, total = torch.accelerator.get_memory_info()
@@ -1729,13 +1738,13 @@ class Gemma4ForConditionalGeneration(
                 # only unpruned images (see chunk construction above),
                 # so the capture decision is per pruned image. DART /
                 # NPrune / Checkered need no vision-tower attention for
-                # selection; they still capture the object layer when
+                # selection; they still capture layers when
                 # return_vision_attention is set (visualizer heatmap).
-                # HyDART needs only the object-layer scores (its diverse
-                # fill uses embedding similarity, not deep attention);
-                # skipping the last layer halves the eager-attention
-                # capture cost, which on Gemma materializes full
-                # (heads, patches, patches) matrices per layer.
+                # When the heatmap flag is on we capture *all* encoder
+                # layers for the layer slider; selection scores are still
+                # taken from object_idx / deep_idx explicitly (never from
+                # capture_layer_idxs[0/1], which would be wrong once the
+                # tuple is range(N)).
                 pruned_cfg = (
                     configs[chunk_items[0][0]]
                     if ratios[chunk_items[0][0]] is not None
@@ -1749,15 +1758,14 @@ class Gemma4ForConditionalGeneration(
                 if chunk_needs_pruning:
                     object_idx = GEMMA4_OBJECT_LAYER - 1
                     deep_idx = len(vt.encoder.layers) - 1
-                    if pruned_cfg.method == "hydart":
-                        capture_layer_idxs: tuple[int, ...] = (object_idx,)
+                    if pruned_cfg.return_vision_attention:
+                        capture_layer_idxs: tuple[int, ...] = tuple(
+                            range(len(vt.encoder.layers))
+                        )
+                    elif pruned_cfg.method == "hydart":
+                        capture_layer_idxs = (object_idx,)
                     elif pruned_cfg.method == "anchorprune":
-                        # Importance = deepest layer. Optionally also
-                        # capture the object layer for the heatmap.
-                        if pruned_cfg.return_vision_attention:
-                            capture_layer_idxs = (object_idx, deep_idx)
-                        else:
-                            capture_layer_idxs = (deep_idx,)
+                        capture_layer_idxs = (deep_idx,)
                     elif pruned_cfg.method in score_only_methods:
                         capture_layer_idxs = (object_idx,)
                     else:
@@ -1777,6 +1785,19 @@ class Gemma4ForConditionalGeneration(
                             pp_tensor[i], pooling_k
                         )
                         num_soft = grid_w * grid_h
+                        vision_layers_list: list[list[float]] | None = None
+                        if pruned_cfg.return_vision_attention:
+                            vision_layers_list = [
+                                aggregate_patch_attention(
+                                    attn_by_layer[li][i],
+                                    valid,
+                                    kernel_idx,
+                                    num_soft,
+                                )
+                                .float()
+                                .tolist()
+                                for li in range(len(vt.encoder.layers))
+                            ]
                         if (
                             pruned_cfg.method == "anchorprune"
                             and not pruned_cfg.return_vision_attention
@@ -1784,16 +1805,13 @@ class Gemma4ForConditionalGeneration(
                             # Deep importance stored in the shallow slot
                             # (deep is None) — existing AnchorPrune path.
                             shallow = aggregate_patch_attention(
-                                attn_by_layer[capture_layer_idxs[0]][i],
+                                attn_by_layer[deep_idx][i],
                                 valid,
                                 kernel_idx,
                                 num_soft,
                             )
                             deep = None
-                        elif (
-                            pruned_cfg.method == "anchorprune"
-                            and pruned_cfg.return_vision_attention
-                        ):
+                        elif pruned_cfg.method == "anchorprune":
                             shallow = aggregate_patch_attention(
                                 attn_by_layer[object_idx][i],
                                 valid,
@@ -1806,23 +1824,37 @@ class Gemma4ForConditionalGeneration(
                                 kernel_idx,
                                 num_soft,
                             )
-                        else:
+                        elif pruned_cfg.method == "hydart" or (
+                            pruned_cfg.method in score_only_methods
+                        ):
                             shallow = aggregate_patch_attention(
-                                attn_by_layer[capture_layer_idxs[0]][i],
+                                attn_by_layer[object_idx][i],
                                 valid,
                                 kernel_idx,
                                 num_soft,
                             )
-                            if len(capture_layer_idxs) > 1:
-                                deep = aggregate_patch_attention(
-                                    attn_by_layer[capture_layer_idxs[1]][i],
-                                    valid,
-                                    kernel_idx,
-                                    num_soft,
-                                )
-                            else:
-                                deep = None
-                        hiprune_scores_map[orig_idx] = (shallow, deep, grid_w, grid_h)
+                            deep = None
+                        else:
+                            # HiPrune / HiPrune++: object + deep.
+                            shallow = aggregate_patch_attention(
+                                attn_by_layer[object_idx][i],
+                                valid,
+                                kernel_idx,
+                                num_soft,
+                            )
+                            deep = aggregate_patch_attention(
+                                attn_by_layer[deep_idx][i],
+                                valid,
+                                kernel_idx,
+                                num_soft,
+                            )
+                        hiprune_scores_map[orig_idx] = (
+                            shallow,
+                            deep,
+                            grid_w,
+                            grid_h,
+                            vision_layers_list,
+                        )
                     del attn_by_layer
                 else:
                     encoder_outputs = vt.encoder(
@@ -1949,6 +1981,17 @@ class Gemma4ForConditionalGeneration(
                         if orig_idx in hiprune_scores_map
                         else None
                     ),
+                    vision_layers=(
+                        hiprune_scores_map[orig_idx][4]
+                        if orig_idx in hiprune_scores_map
+                        else None
+                    ),
+                    vision_layer_object_idx=(
+                        GEMMA4_OBJECT_LAYER - 1
+                        if orig_idx in hiprune_scores_map
+                        and hiprune_scores_map[orig_idx][4] is not None
+                        else None
+                    ),
                 )
             elif ratio is not None and method == "nprune":
                 # NPrune: pure uniform-lattice sampling — no attention,
@@ -1974,6 +2017,17 @@ class Gemma4ForConditionalGeneration(
                     (
                         hiprune_scores_map[orig_idx][0]
                         if orig_idx in hiprune_scores_map
+                        else None
+                    ),
+                    vision_layers=(
+                        hiprune_scores_map[orig_idx][4]
+                        if orig_idx in hiprune_scores_map
+                        else None
+                    ),
+                    vision_layer_object_idx=(
+                        GEMMA4_OBJECT_LAYER - 1
+                        if orig_idx in hiprune_scores_map
+                        and hiprune_scores_map[orig_idx][4] is not None
                         else None
                     ),
                 )
@@ -2005,13 +2059,29 @@ class Gemma4ForConditionalGeneration(
                         if orig_idx in hiprune_scores_map
                         else None
                     ),
+                    vision_layers=(
+                        hiprune_scores_map[orig_idx][4]
+                        if orig_idx in hiprune_scores_map
+                        else None
+                    ),
+                    vision_layer_object_idx=(
+                        GEMMA4_OBJECT_LAYER - 1
+                        if orig_idx in hiprune_scores_map
+                        and hiprune_scores_map[orig_idx][4] is not None
+                        else None
+                    ),
                 )
             elif ratio is not None:
-                shallow, deep, grid_w, grid_h = hiprune_scores_map[orig_idx]
+                shallow, deep, grid_w, grid_h, vision_layers = hiprune_scores_map[
+                    orig_idx
+                ]
                 num_soft = valid_states.shape[0]
                 assert shallow.shape[0] == num_soft, (
                     f"HiPrune score length {shallow.shape[0]} != pooled "
                     f"soft-token count {num_soft}"
+                )
+                _vision_obj_idx = (
+                    GEMMA4_OBJECT_LAYER - 1 if vision_layers is not None else None
                 )
                 if method == "hydart":
                     lambda_seed, lambda_pick = cfg.lambda_seed, cfg.lambda_pick
@@ -2034,19 +2104,24 @@ class Gemma4ForConditionalGeneration(
                         )
                     )
                     valid_states = valid_states[kept_mask]
-                    hiprune_metadata[orig_idx] = build_hydart_metadata(
-                        anchor_idx,
-                        buffer_idx,
-                        diverse_idx,
-                        kept_mask,
+                    hiprune_metadata[orig_idx] = attach_object_layer_scores(
+                        build_hydart_metadata(
+                            anchor_idx,
+                            buffer_idx,
+                            diverse_idx,
+                            kept_mask,
+                            shallow,
+                            sim_stats,
+                            grid_w,
+                            grid_h,
+                            ratio,
+                            object_layer=GEMMA4_OBJECT_LAYER,
+                            lambda_seed=lambda_seed,
+                            lambda_pick=lambda_pick,
+                        ),
                         shallow,
-                        sim_stats,
-                        grid_w,
-                        grid_h,
-                        ratio,
-                        object_layer=GEMMA4_OBJECT_LAYER,
-                        lambda_seed=lambda_seed,
-                        lambda_pick=lambda_pick,
+                        vision_layers=vision_layers,
+                        vision_layer_object_idx=_vision_obj_idx,
                     )
                 elif method == "anchorprune":
                     # AnchorPrune (unofficial Gemma analog — the paper
@@ -2101,6 +2176,8 @@ class Gemma4ForConditionalGeneration(
                             ),
                         ),
                         object_scores,
+                        vision_layers=vision_layers,
+                        vision_layer_object_idx=_vision_obj_idx,
                     )
                 elif method == "hiprune_pp":
                     assert deep is not None
@@ -2137,20 +2214,25 @@ class Gemma4ForConditionalGeneration(
                         beta=cfg.beta,
                     )
                     valid_states = valid_states[kept_mask]
-                    hiprune_metadata[orig_idx] = build_hiprune_pp_metadata(
-                        anchor_idx,
-                        buffer_idx,
-                        register_idx,
-                        prompt_idx,
-                        kept_mask,
+                    hiprune_metadata[orig_idx] = attach_object_layer_scores(
+                        build_hiprune_pp_metadata(
+                            anchor_idx,
+                            buffer_idx,
+                            register_idx,
+                            prompt_idx,
+                            kept_mask,
+                            shallow,
+                            deep,
+                            text_similarity,
+                            grid_w,
+                            grid_h,
+                            ratio,
+                            object_layer=GEMMA4_OBJECT_LAYER,
+                            beta=cfg.beta,
+                        ),
                         shallow,
-                        deep,
-                        text_similarity,
-                        grid_w,
-                        grid_h,
-                        ratio,
-                        object_layer=GEMMA4_OBJECT_LAYER,
-                        beta=cfg.beta,
+                        vision_layers=vision_layers,
+                        vision_layer_object_idx=_vision_obj_idx,
                     )
                 else:
                     assert deep is not None
@@ -2158,16 +2240,21 @@ class Gemma4ForConditionalGeneration(
                         shallow, deep, num_soft, grid_w, ratio
                     )
                     valid_states = valid_states[kept_mask]
-                    hiprune_metadata[orig_idx] = build_hiprune_metadata(
-                        anchor_idx,
-                        buffer_idx,
-                        register_idx,
-                        kept_mask,
+                    hiprune_metadata[orig_idx] = attach_object_layer_scores(
+                        build_hiprune_metadata(
+                            anchor_idx,
+                            buffer_idx,
+                            register_idx,
+                            kept_mask,
+                            shallow,
+                            deep,
+                            grid_w,
+                            grid_h,
+                            ratio,
+                        ),
                         shallow,
-                        deep,
-                        grid_w,
-                        grid_h,
-                        ratio,
+                        vision_layers=vision_layers,
+                        vision_layer_object_idx=_vision_obj_idx,
                     )
 
             all_valid_states[orig_idx] = valid_states

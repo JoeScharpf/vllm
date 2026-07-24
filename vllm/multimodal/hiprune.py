@@ -424,19 +424,30 @@ def unpack_hiprune_config(row: torch.Tensor | None) -> HipruneConfig:
 def attach_object_layer_scores(
     metadata: dict[str, object],
     shallow_scores: torch.Tensor | None,
+    vision_layers: list[list[float]] | None = None,
+    vision_layer_object_idx: int | None = None,
 ) -> dict[str, object]:
-    """Attach method-independent object-layer scores for the heatmap UI.
+    """Attach method-independent vision attention scores for the heatmap UI.
 
-    No-op when ``shallow_scores`` is None. Merges into an existing
+    Always writes ``scores.object_layer`` when ``shallow_scores`` is set
+    (backcompat with the single-layer heatmap). When ``vision_layers`` is
+    provided (Gemma visualizer path), also writes the full early→late
+    stack plus the 0-based object-layer index for the slider default.
+    No-op when both score inputs are None. Merges into an existing
     ``scores`` dict (e.g. DART already has ``key_norm``).
     """
-    if shallow_scores is None:
+    if shallow_scores is None and vision_layers is None:
         return metadata
     scores = metadata.get("scores")
     if not isinstance(scores, dict):
         scores = {}
         metadata["scores"] = scores
-    scores["object_layer"] = shallow_scores.float().tolist()
+    if shallow_scores is not None:
+        scores["object_layer"] = shallow_scores.float().tolist()
+    if vision_layers is not None:
+        scores["vision_layers"] = vision_layers
+        if vision_layer_object_idx is not None:
+            scores["vision_layer_object_idx"] = int(vision_layer_object_idx)
     return metadata
 
 
