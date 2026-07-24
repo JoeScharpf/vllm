@@ -300,6 +300,7 @@ HIPRUNE_MM_KWARG_KEYS = (
     "hiprune_stride",
     "hiprune_anchor_kmin",
     "hiprune_tau",
+    "hiprune_return_vision_attention",
 )
 
 # Method <-> id mapping for the packed per-image config tensor (mm
@@ -316,8 +317,9 @@ HIPRUNE_METHOD_IDS: dict[str, int] = {
 _HIPRUNE_ID_METHODS = {v: k for k, v in HIPRUNE_METHOD_IDS.items()}
 
 # Row layout of the packed config: (method_id, lambda_seed, lambda_pick,
-# beta, pivot_image, pivot_text, stride, anchor_kmin, tau).
-HIPRUNE_CONFIG_WIDTH = 9
+# beta, pivot_image, pivot_text, stride, anchor_kmin, tau,
+# return_vision_attention).
+HIPRUNE_CONFIG_WIDTH = 10
 
 
 @dataclass(frozen=True)
@@ -333,6 +335,28 @@ class HipruneConfig:
     stride: int
     anchor_kmin: int
     tau: float
+    # When True, encode paths that normally skip vision attention still
+    # capture object-layer scores for the visualizer heatmap. Default
+    # False so TTFT/eval benches stay cheap for nprune/checkered/dart.
+    return_vision_attention: bool = False
+
+
+def get_return_vision_attention(
+    merged_kwargs: Mapping[str, object] | None = None,
+) -> bool:
+    """Whether to return object-layer scores for every prune method.
+
+    Per-request ``hiprune_return_vision_attention`` mm kwarg (mapped from
+    ``token_pruning_params.return_vision_attention``). Default False.
+    """
+    val = (
+        merged_kwargs.get("hiprune_return_vision_attention")
+        if merged_kwargs
+        else None
+    )
+    if val is None:
+        return False
+    return bool(float(val))  # type: ignore[arg-type]
 
 
 def pack_hiprune_config(
@@ -352,6 +376,7 @@ def pack_hiprune_config(
     stride = get_nprune_stride(merged_kwargs)
     anchor_kmin = get_anchorprune_kmin(merged_kwargs)
     tau = get_anchorprune_tau(merged_kwargs)
+    return_attn = get_return_vision_attention(merged_kwargs)
     return torch.tensor(
         [
             float(HIPRUNE_METHOD_IDS[method]),
@@ -363,6 +388,7 @@ def pack_hiprune_config(
             float(stride),
             float(anchor_kmin),
             tau,
+            1.0 if return_attn else 0.0,
         ],
         dtype=torch.float32,
     )
@@ -391,7 +417,27 @@ def unpack_hiprune_config(row: torch.Tensor | None) -> HipruneConfig:
         stride=int(round(vals[6])),
         anchor_kmin=int(round(vals[7])),
         tau=vals[8],
+        return_vision_attention=bool(round(vals[9])),
     )
+
+
+def attach_object_layer_scores(
+    metadata: dict[str, object],
+    shallow_scores: torch.Tensor | None,
+) -> dict[str, object]:
+    """Attach method-independent object-layer scores for the heatmap UI.
+
+    No-op when ``shallow_scores`` is None. Merges into an existing
+    ``scores`` dict (e.g. DART already has ``key_norm``).
+    """
+    if shallow_scores is None:
+        return metadata
+    scores = metadata.get("scores")
+    if not isinstance(scores, dict):
+        scores = {}
+        metadata["scores"] = scores
+    scores["object_layer"] = shallow_scores.float().tolist()
+    return metadata
 
 
 def get_hiprune_ratio(merged_kwargs: Mapping[str, object]) -> float | None:

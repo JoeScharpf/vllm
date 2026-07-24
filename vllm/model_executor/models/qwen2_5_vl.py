@@ -82,6 +82,7 @@ from vllm.multimodal.hiprune import (
     QWEN2_5_VL_OBJECT_LAYER,
     anchorprune_resolve_kmin,
     anchorprune_select,
+    attach_object_layer_scores,
     build_anchorprune_metadata,
     build_dart_metadata,
     build_checkered_metadata,
@@ -1964,10 +1965,21 @@ class Qwen2_5_VLForConditionalGeneration(
             )
             method = cfg.method
 
-            # NPrune: pure uniform-lattice sampling — no attention
-            # capture, no scores, no prompt. Plain visual forward.
+            # NPrune: pure uniform-lattice sampling. Plain visual forward
+            # unless return_vision_attention requests object-layer scores.
             if method == "nprune":
-                embeds = self.visual(pv, grid_thw=[thw])
+                object_scores = None
+                if cfg.return_vision_attention:
+                    embeds, scores_by_layer = (
+                        self.visual.forward_capturing_hiprune_scores(
+                            pv,
+                            [thw],
+                            capture_layer_idxs=(object_layer_idx,),
+                        )
+                    )
+                    object_scores = scores_by_layer[object_layer_idx]
+                else:
+                    embeds = self.visual(pv, grid_thw=[thw])
                 t, h, w = thw
                 grid_h = h // merge_size
                 grid_w = w // merge_size
@@ -1978,18 +1990,32 @@ class Qwen2_5_VLForConditionalGeneration(
                 kept_idx, kept_mask = nprune_select(
                     t * grid_h, grid_w, cfg.stride, device=embeds.device
                 )
-                metadata = build_nprune_metadata(
-                    kept_idx, kept_mask, grid_w, grid_h, cfg.stride
+                metadata = attach_object_layer_scores(
+                    build_nprune_metadata(
+                        kept_idx, kept_mask, grid_w, grid_h, cfg.stride
+                    ),
+                    object_scores,
                 )
                 image_embeds_out.append(embeds[kept_mask])
                 self._hiprune_kept_masks[idx] = kept_mask
                 self._hiprune_metadata[idx] = metadata
                 continue
 
-            # Checkered: deterministic checkerboard — no attention
-            # capture, no scores, no prompt. Plain visual forward.
+            # Checkered: deterministic checkerboard. Plain visual forward
+            # unless return_vision_attention requests object-layer scores.
             if method == "checkered":
-                embeds = self.visual(pv, grid_thw=[thw])
+                object_scores = None
+                if cfg.return_vision_attention:
+                    embeds, scores_by_layer = (
+                        self.visual.forward_capturing_hiprune_scores(
+                            pv,
+                            [thw],
+                            capture_layer_idxs=(object_layer_idx,),
+                        )
+                    )
+                    object_scores = scores_by_layer[object_layer_idx]
+                else:
+                    embeds = self.visual(pv, grid_thw=[thw])
                 t, h, w = thw
                 grid_h = h // merge_size
                 grid_w = w // merge_size
@@ -2001,8 +2027,11 @@ class Qwen2_5_VLForConditionalGeneration(
                 kept_idx, kept_mask = checkered_select(
                     t * grid_h, grid_w, device=embeds.device
                 )
-                metadata = build_checkered_metadata(
-                    kept_idx, kept_mask, grid_w, grid_h
+                metadata = attach_object_layer_scores(
+                    build_checkered_metadata(
+                        kept_idx, kept_mask, grid_w, grid_h
+                    ),
+                    object_scores,
                 )
                 image_embeds_out.append(embeds[kept_mask])
                 self._hiprune_kept_masks[idx] = kept_mask
@@ -2016,14 +2045,23 @@ class Qwen2_5_VLForConditionalGeneration(
             # space over the merged embeds (the official Qwen signals).
             if method == "anchorprune":
                 importance_layer_idx = max(self.visual.fullatt_block_indexes)
+                if cfg.return_vision_attention:
+                    capture_layer_idxs = (object_layer_idx, importance_layer_idx)
+                else:
+                    capture_layer_idxs = (importance_layer_idx,)
                 embeds, scores_by_layer = (
                     self.visual.forward_capturing_hiprune_scores(
                         pv,
                         [thw],
-                        capture_layer_idxs=(importance_layer_idx,),
+                        capture_layer_idxs=capture_layer_idxs,
                     )
                 )
                 importance = scores_by_layer[importance_layer_idx]
+                object_scores = (
+                    scores_by_layer[object_layer_idx]
+                    if cfg.return_vision_attention
+                    else None
+                )
                 t, h, w = thw
                 grid_h = h // merge_size
                 grid_w = w // merge_size
@@ -2052,21 +2090,24 @@ class Qwen2_5_VLForConditionalGeneration(
                         tau=cfg.tau,
                     )
                 )
-                metadata = build_anchorprune_metadata(
-                    anchor_idx,
-                    expansion_idx,
-                    kept_mask,
-                    grid_w,
-                    grid_h,
-                    ratio,
-                    anchor_kmin_used=anchorprune_resolve_kmin(
-                        k_total, cfg.anchor_kmin
+                metadata = attach_object_layer_scores(
+                    build_anchorprune_metadata(
+                        anchor_idx,
+                        expansion_idx,
+                        kept_mask,
+                        grid_w,
+                        grid_h,
+                        ratio,
+                        anchor_kmin_used=anchorprune_resolve_kmin(
+                            k_total, cfg.anchor_kmin
+                        ),
+                        tau=cfg.tau,
+                        num_prompt_tokens=(
+                            0 if prompt_embeds is None
+                            else int(prompt_embeds.shape[0])
+                        ),
                     ),
-                    tau=cfg.tau,
-                    num_prompt_tokens=(
-                        0 if prompt_embeds is None
-                        else int(prompt_embeds.shape[0])
-                    ),
+                    object_scores,
                 )
                 image_embeds_out.append(embeds[kept_mask])
                 self._hiprune_kept_masks[idx] = kept_mask
@@ -2074,7 +2115,18 @@ class Qwen2_5_VLForConditionalGeneration(
                 continue
 
             if method == "dart":
-                embeds = self.visual(pv, grid_thw=[thw])
+                object_scores = None
+                if cfg.return_vision_attention:
+                    embeds, scores_by_layer = (
+                        self.visual.forward_capturing_hiprune_scores(
+                            pv,
+                            [thw],
+                            capture_layer_idxs=(object_layer_idx,),
+                        )
+                    )
+                    object_scores = scores_by_layer[object_layer_idx]
+                else:
+                    embeds = self.visual(pv, grid_thw=[thw])
                 t, h, w = thw
                 grid_h = h // merge_size
                 grid_w = w // merge_size
@@ -2104,19 +2156,22 @@ class Qwen2_5_VLForConditionalGeneration(
                 img_piv, txt_piv, diverse_idx, kept_mask, pivot_sim = dart_select(
                     hidden, key_l1, num_tokens, ratio, p_img, p_txt
                 )
-                metadata = build_dart_metadata(
-                    img_piv,
-                    diverse_idx,
-                    kept_mask,
-                    key_l1,
-                    pivot_sim,
-                    grid_w,
-                    grid_h,
-                    ratio,
-                    pivot_image=p_img,
-                    pivot_text=p_txt,
-                    num_text_pivots=int(txt_piv.numel()),
-                    dart_layer=dart_layer,
+                metadata = attach_object_layer_scores(
+                    build_dart_metadata(
+                        img_piv,
+                        diverse_idx,
+                        kept_mask,
+                        key_l1,
+                        pivot_sim,
+                        grid_w,
+                        grid_h,
+                        ratio,
+                        pivot_image=p_img,
+                        pivot_text=p_txt,
+                        num_text_pivots=int(txt_piv.numel()),
+                        dart_layer=dart_layer,
+                    ),
+                    object_scores,
                 )
                 image_embeds_out.append(embeds[kept_mask])
                 self._hiprune_kept_masks[idx] = kept_mask
