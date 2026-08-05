@@ -416,6 +416,76 @@ class CLIPAttention(nn.Module):
 
         return attn_output, None
 
+    def compute_hiprune_key_scores(
+        self,
+        hidden_states: torch.Tensor,
+        query_chunk_size: int = 512,
+    ) -> torch.Tensor:
+        """Per-key attention scores for HiPrune, without running attention.
+
+        Recomputes this layer's Q/K from the block input (the same
+        arithmetic as :meth:`forward`) and returns, for every key token,
+        the post-softmax attention it receives averaged over all heads
+        and all query tokens — the HiPrune authors' "global attention"
+        statistic. The fused attention backend never materializes these
+        weights, hence the explicit recomputation (mirrors
+        ``Qwen2_5_VisionAttention.compute_hiprune_key_scores``, minus
+        rope and windowing, which CLIP does not have).
+
+        Chunked over queries so the full (heads, seq, seq) matrix is
+        never materialized; softmax is per-query-row, so chunking is
+        exact.
+
+        Args:
+            hidden_states: ``(1, seq_len, embed_dim)`` normed hidden
+                states entering this block (``blk.layer_norm1(x)``).
+                One image at a time: the dense softmax must not span
+                other images' tokens.
+            query_chunk_size: queries scored per chunk.
+
+        Returns:
+            ``(seq_len,)`` float32 per-key scores including the CLS
+            token at index 0 (a distribution: sums to 1).
+        """
+        assert hidden_states.shape[0] == 1, (
+            "HiPrune score capture processes one image at a time"
+        )
+        with torch.no_grad():
+            qkv_states, _ = self.qkv_proj(hidden_states)
+            q, k, _ = qkv_states.chunk(3, dim=-1)
+            seq_len = q.shape[1]
+
+            # (heads, seq, head_dim) / (heads, head_dim, seq). The QK^T
+            # matmul runs in the model dtype (tensor cores); the softmax
+            # accumulates in float32. Selection is by rank, so fp16/bf16
+            # logits do not change the kept set in practice.
+            q = (
+                q.reshape(seq_len, self.num_heads_per_partition, self.head_dim)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            k_t = (
+                k.reshape(seq_len, self.num_heads_per_partition, self.head_dim)
+                .permute(1, 2, 0)
+                .contiguous()
+            )
+
+            scores = torch.zeros(seq_len, dtype=torch.float32, device=q.device)
+            for start in range(0, seq_len, query_chunk_size):
+                q_chunk = q[:, start : start + query_chunk_size]
+                logits = torch.matmul(q_chunk, k_t) * self.scale
+                probs = torch.softmax(logits, dim=-1)
+                scores += probs.sum(dim=(0, 1), dtype=torch.float32)
+
+            if self.tp_size > 1:
+                from vllm.distributed.communication_op import (
+                    tensor_model_parallel_all_reduce,
+                )
+
+                scores = tensor_model_parallel_all_reduce(scores)
+
+            return scores / (self.num_heads * seq_len)
+
 
 class CLIPMLP(nn.Module):
     def __init__(
@@ -705,6 +775,55 @@ class CLIPVisionTransformer(nn.Module):
 
         return encoder_outputs
 
+    def forward_capturing_hiprune_scores(
+        self,
+        pixel_values: torch.Tensor,
+        capture_layer_idxs: tuple[int, ...],
+        feature_select_strategy: VisionFeatureSelectStrategy | None = None,
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+        """Encode a single image, capturing HiPrune attention scores.
+
+        Same computation as :meth:`forward` (without ``select_layers``),
+        but at each block index in ``capture_layer_idxs`` the per-key
+        attention scores are computed from that block's normed input.
+
+        Restricted to a single image so the dense score softmax never
+        spans keys from other images, exactly like the HiPrune reference,
+        which encodes one image at a time.
+
+        Returns:
+            ``(features, scores_by_layer)`` where ``features`` is the
+            usual encoder output with ``feature_select_strategy``
+            applied, and ``scores_by_layer`` maps each captured block
+            index to ``(seq_len,)`` float32 per-key scores over the FULL
+            token sequence (CLS at index 0), regardless of the feature
+            selection strategy.
+        """
+        assert pixel_values.shape[0] == 1, (
+            "HiPrune score capture processes one image at a time"
+        )
+        hidden_states = self.embeddings(pixel_values)
+        hidden_states = self.pre_layrnorm(hidden_states)
+
+        scores_by_layer: dict[int, torch.Tensor] = {}
+        for layer_idx, encoder_layer in enumerate(self.encoder.layers):
+            if layer_idx in capture_layer_idxs:
+                scores_by_layer[layer_idx] = (
+                    encoder_layer.self_attn.compute_hiprune_key_scores(
+                        encoder_layer.layer_norm1(hidden_states)
+                    )
+                )
+            hidden_states = encoder_layer(hidden_states)
+
+        features = resolve_visual_encoder_outputs(
+            hidden_states,
+            self.post_layernorm,
+            select_layers=None,
+            max_possible_layers=self.config.num_hidden_layers,
+            feature_select_strategy=feature_select_strategy,
+        )
+        return features, scores_by_layer
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         skip_prefixes: list[str] = []
         if self.post_layernorm is None:
@@ -752,6 +871,19 @@ class CLIPVisionModel(nn.Module):
         return self.vision_model(
             pixel_values,
             select_layers=select_layers,
+            feature_select_strategy=feature_select_strategy,
+        )
+
+    def forward_capturing_hiprune_scores(
+        self,
+        pixel_values: torch.Tensor,
+        capture_layer_idxs: tuple[int, ...],
+        feature_select_strategy: VisionFeatureSelectStrategy | None = None,
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+        """See :meth:`CLIPVisionTransformer.forward_capturing_hiprune_scores`."""
+        return self.vision_model.forward_capturing_hiprune_scores(
+            pixel_values,
+            capture_layer_idxs=capture_layer_idxs,
             feature_select_strategy=feature_select_strategy,
         )
 

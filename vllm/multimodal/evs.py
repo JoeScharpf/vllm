@@ -274,6 +274,19 @@ def recompute_mrope_positions(
             in_the_middle_of_media = (
                 seen_mm_tokens > seem_mm_tokens_before_last_vision_start
             )
+            # Boundary case: the previous prefill chunk ended exactly after
+            # the vision_start token, before any media token. Zero media
+            # tokens of this segment have been computed, but its
+            # vision_start is already behind num_computed_tokens, so
+            # searching for the *next* vision_start would find nothing
+            # (IndexError on single-media prompts). Treat it as being at
+            # the start of the current media segment.
+            if (
+                not in_the_middle_of_media
+                and num_computed_tokens > last_vision_start_token
+                and seen_mm_tokens == seem_mm_tokens_before_last_vision_start
+            ):
+                in_the_middle_of_media = True
             # For Qwen3 VL, we can be inside a media segment even before any
             # video tokens appear (timestamp tokens are text). If we've passed
             # the last vision_start token but haven't reached the first video

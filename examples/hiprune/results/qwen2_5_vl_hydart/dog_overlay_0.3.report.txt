@@ -1,0 +1,12 @@
+answer      : A fluffy white puppy is sitting on a moss-covered log, looking directly at the camera with its ears perked up.
+
+tokens      : prompt 324 | completion 25
+image 0  (hydart)
+  grid      : 29 x 34  (986 soft tokens)
+  retention : 0.3000  (object layer 16, alpha 0.1, lambda_seed 0.1, lambda_pick 0.5)
+  kept      : 296 (30.0%)   pruned: 690 (70.0%)
+    anchors   : 6  [246, 245, 811, 638, 609, 8]
+    buffers   : 20  [0, 7, 9, 37, 216, 217, 244, 247, 274, 275, 580, 608, 610, 637, 639, 667, 782, 810, 812, 840]
+    diverse   : 270
+  mean attention (object layer): anchor 0.0008547 | buffer 0.0003813 | diverse 0.000399 | kept 0.000407 | pruned 0.0001877
+  cosine similarity: diverse at selection 0.7461 | pruned vs kept 0.7908

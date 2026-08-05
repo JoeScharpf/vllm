@@ -1,0 +1,8 @@
+MME | Qwen/Qwen2.5-VL-3B-Instruct | 2374 questions (full benchmark)
+
+ retention  accuracy  perception  cognition  invalid  prompt tok  mean TTFT
+---------------------------------------------------------------------------
+  baseline     0.849      1607.9      618.9        0      2171.3     0.056s
+      0.50     0.626      1185.0      321.8      612      1105.3     0.061s
+      0.30     0.676      1234.6      302.1      483       678.9     0.058s
+      0.14     0.605      1035.7      176.1      585       337.7     0.055s

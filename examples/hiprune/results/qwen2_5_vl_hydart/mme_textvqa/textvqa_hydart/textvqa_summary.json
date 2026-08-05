@@ -1,0 +1,48 @@
+{
+  "dataset": "lmms-lab/textvqa (validation)",
+  "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "num_samples": 1000,
+  "seed": 0,
+  "results": [
+    {
+      "ratio": 1.0,
+      "num_samples": 1000,
+      "vqa_accuracy": 0.8016666666666666,
+      "zero_credit": 159,
+      "mean_prompt_tokens": 1019.761,
+      "mean_ttft_s": 0.19867074626187484,
+      "median_ttft_s": 0.18829980306327343,
+      "accuracy_pass_seconds": 169.01969188079238
+    },
+    {
+      "ratio": 0.5,
+      "num_samples": 1000,
+      "vqa_accuracy": 0.781,
+      "zero_credit": 175,
+      "mean_prompt_tokens": 529.645,
+      "mean_ttft_s": 0.252402548554043,
+      "median_ttft_s": 0.2384109036065638,
+      "accuracy_pass_seconds": 209.65918277483433
+    },
+    {
+      "ratio": 0.3,
+      "num_samples": 1000,
+      "vqa_accuracy": 0.7403333333333334,
+      "zero_credit": 216,
+      "mean_prompt_tokens": 333.458,
+      "mean_ttft_s": 0.19845966078961888,
+      "median_ttft_s": 0.19710781052708626,
+      "accuracy_pass_seconds": 194.72032265737653
+    },
+    {
+      "ratio": 0.14,
+      "num_samples": 1000,
+      "vqa_accuracy": 0.6343333333333334,
+      "zero_credit": 330,
+      "mean_prompt_tokens": 176.557,
+      "mean_ttft_s": 0.17294962561378877,
+      "median_ttft_s": 0.16896348632872105,
+      "accuracy_pass_seconds": 161.44861299917102
+    }
+  ]
+}
