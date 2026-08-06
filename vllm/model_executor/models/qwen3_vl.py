@@ -103,6 +103,7 @@ from vllm.multimodal.video_prune.vidcom2 import (
 from vllm.multimodal.video_prune.vidcom2 import (
     compute_retention_mask as vidcom2_compute_retention_mask,
 )
+from vllm.multimodal.spatial_prune import spatial_tokens_per_frame
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.protocol import TokenizerLike
 from vllm.tokenizers.registry import cached_tokenizer_from_config
@@ -1352,21 +1353,34 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                     merge_size**2
                 )
 
-                # Apply video pruning (EVS or VidCom2) if enabled.
+                # Apply video pruning if enabled.
                 if pruning_spec is not None:
                     method, prune_q = pruning_spec
-                    count_fn = (
-                        vidcom2_compute_retained_tokens_count
-                        if method == "vidcom2"
-                        else compute_retained_tokens_count
-                    )
-                    num_tokens = count_fn(
-                        tokens_per_frame=tokens_per_frame_base,
-                        num_frames=num_frames,
-                        q=prune_q,
-                    )
-                    tokens_per_frame = [num_tokens] + [0] * (num_frames - 1)
-                    select_token_id = False
+                    if method in ("nprune", "checkered"):
+                        grid_h = int(video_grid_thw[0, 1]) // merge_size
+                        grid_w = int(video_grid_thw[0, 2]) // merge_size
+                        keep = spatial_tokens_per_frame(
+                            method,
+                            tokens_per_frame_base,
+                            grid_h,
+                            grid_w,
+                            nprune_stride=self.info.ctx.get_mm_config().nprune_stride,
+                        )
+                        tokens_per_frame = [keep] * num_frames
+                        select_token_id = True
+                    else:
+                        count_fn = (
+                            vidcom2_compute_retained_tokens_count
+                            if method == "vidcom2"
+                            else compute_retained_tokens_count
+                        )
+                        num_tokens = count_fn(
+                            tokens_per_frame=tokens_per_frame_base,
+                            num_frames=num_frames,
+                            q=prune_q,
+                        )
+                        tokens_per_frame = [num_tokens] + [0] * (num_frames - 1)
+                        select_token_id = False
                 else:
                     tokens_per_frame = [tokens_per_frame_base] * num_frames
                     select_token_id = True
@@ -1479,25 +1493,39 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                 f"video length ({grid_thw[0]})."
             )
 
-            # Compute tokens per frame, with EVS / VidCom2 support
+            # Compute tokens per frame, with EVS / VidCom2 / spatial support
             num_frames = int(grid_thw[0])
             tokens_per_frame_base = int(grid_thw[1:].prod()) // merge_length
+            merge_size = image_processor.merge_size
 
             pruning_spec = self.info.ctx.get_mm_config().get_video_pruning_spec()
             if pruning_spec is not None:
                 method, prune_q = pruning_spec
-                count_fn = (
-                    vidcom2_compute_retained_tokens_count
-                    if method == "vidcom2"
-                    else compute_retained_tokens_count
-                )
-                num_tokens = count_fn(
-                    tokens_per_frame=tokens_per_frame_base,
-                    num_frames=num_frames,
-                    q=prune_q,
-                )
-                tokens_per_frame = [num_tokens] + [0] * (num_frames - 1)
-                select_token_id = False
+                if method in ("nprune", "checkered"):
+                    grid_h = int(grid_thw[1]) // merge_size
+                    grid_w = int(grid_thw[2]) // merge_size
+                    keep = spatial_tokens_per_frame(
+                        method,
+                        tokens_per_frame_base,
+                        grid_h,
+                        grid_w,
+                        nprune_stride=self.info.ctx.get_mm_config().nprune_stride,
+                    )
+                    tokens_per_frame = [keep] * num_frames
+                    select_token_id = True
+                else:
+                    count_fn = (
+                        vidcom2_compute_retained_tokens_count
+                        if method == "vidcom2"
+                        else compute_retained_tokens_count
+                    )
+                    num_tokens = count_fn(
+                        tokens_per_frame=tokens_per_frame_base,
+                        num_frames=num_frames,
+                        q=prune_q,
+                    )
+                    tokens_per_frame = [num_tokens] + [0] * (num_frames - 1)
+                    select_token_id = False
             else:
                 tokens_per_frame = [tokens_per_frame_base] * num_frames
                 select_token_id = True

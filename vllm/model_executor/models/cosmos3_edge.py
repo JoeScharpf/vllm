@@ -19,7 +19,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.evs import (
+from vllm.multimodal.video_prune.evs import (
     compute_mrope_for_media,
     compute_retention_mask,
 )
@@ -514,9 +514,11 @@ class Cosmos3EdgeForConditionalGeneration(
         - self.visual: SigLIP2 encoder + patch merger + projector
         - self.language_model: Cosmos3EdgeForCausalLM (pure attention + RoPE)
 
-    EVS (Efficient Video Sampling) reuses the Qwen3-VL prune + mRoPE path:
-    enable with ``--video-pruning-rate``.
+    EVS / VidCom2 / NPrune / Checkered video pruning via
+    ``--video-pruning-rate`` + ``--video-pruning-method``.
     """
+
+    supported_video_pruning_methods = ("evs", "vidcom2", "nprune", "checkered")
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
@@ -584,9 +586,23 @@ class Cosmos3EdgeForConditionalGeneration(
         self.multimodal_config = multimodal_config
         self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
-        self.video_pruning_rate = multimodal_config.video_pruning_rate
+        pruning_spec = multimodal_config.get_video_pruning_spec()
+        if pruning_spec is None:
+            self.video_pruning_method = None
+            self.video_pruning_rate = multimodal_config.video_pruning_rate
+        else:
+            self.video_pruning_method, self.video_pruning_rate = pruning_spec
+        self.nprune_stride = multimodal_config.nprune_stride
         self.is_multimodal_pruning_enabled = (
             multimodal_config.is_multimodal_pruning_enabled()
+        )
+        self.is_spatial_video_pruning = self.video_pruning_method in (
+            "nprune",
+            "checkered",
+        )
+        self.is_evs_style_video_pruning = self.video_pruning_method in (
+            "evs",
+            "vidcom2",
         )
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
@@ -724,7 +740,7 @@ class Cosmos3EdgeForConditionalGeneration(
         image_input: Qwen2_5_VLImageInputs,
     ) -> tuple[torch.Tensor, ...]:
         """Append mRoPE position channels so images stay aligned after video EVS."""
-        if not self.is_multimodal_pruning_enabled:
+        if not self.is_evs_style_video_pruning:
             return image_embeds_split
 
         merge_size = self.visual.spatial_merge_size
@@ -741,6 +757,55 @@ class Cosmos3EdgeForConditionalGeneration(
             )
             image_embeds_out.append(torch.cat([emb, positions], dim=1))
         return tuple(image_embeds_out)
+
+    def _postprocess_video_embeds_spatial(
+        self,
+        video_embeds_split: tuple[torch.Tensor, ...],
+        video_input: Qwen2_5_VLVideoInputs,
+    ) -> tuple[torch.Tensor, ...]:
+        """Per-frame NPrune / Checkered prune with EVS-compatible mRoPE channels."""
+        assert self.video_pruning_method in ("nprune", "checkered")
+        from vllm.multimodal.spatial_prune import (
+            checkered_select,
+            nprune_select,
+        )
+
+        grid_thw = video_input["video_grid_thw"]
+        assert grid_thw.ndim == 2
+        merge_size = self.visual.spatial_merge_size
+        out = []
+        for emb, size in zip(video_embeds_split, grid_thw.tolist()):
+            t, h, w = size
+            grid_h, grid_w = h // merge_size, w // merge_size
+            tokens_per_frame = grid_h * grid_w
+            if emb.shape[0] != t * tokens_per_frame:
+                raise ValueError(
+                    f"Expected {t * tokens_per_frame} video tokens, got {emb.shape[0]}"
+                )
+
+            if self.video_pruning_method == "nprune":
+                _, kept_mask = nprune_select(
+                    grid_h, grid_w, self.nprune_stride, device=emb.device
+                )
+            else:
+                _, kept_mask = checkered_select(grid_h, grid_w, device=emb.device)
+
+            positions = compute_mrope_for_media(
+                torch.tensor(size, device=emb.device),
+                merge_size,
+            ).to(emb.device, non_blocking=True)
+            # Dummy 5th channel so recompute_mrope_positions can strip :-5.
+            positions = torch.cat(
+                [positions, torch.zeros_like(positions[:, 0:1])],
+                dim=1,
+            )
+
+            emb_thw = emb.view(t, tokens_per_frame, emb.shape[-1])
+            pos_thw = positions.view(t, tokens_per_frame, positions.shape[-1])
+            emb_kept = emb_thw[:, kept_mask, :].reshape(-1, emb.shape[-1])
+            pos_kept = pos_thw[:, kept_mask, :].reshape(-1, positions.shape[-1])
+            out.append(torch.cat([emb_kept, pos_kept], dim=1))
+        return tuple(out)
 
     def _postprocess_video_embeds_evs(
         self,
@@ -905,7 +970,11 @@ class Cosmos3EdgeForConditionalGeneration(
                 multimodal_embeddings.extend(image_embeddings)
             if modality == "video":
                 video_embeddings = self._process_video_input(multimodal_input)
-                if self.is_multimodal_pruning_enabled:
+                if self.is_spatial_video_pruning:
+                    video_embeddings = self._postprocess_video_embeds_spatial(
+                        video_embeddings, multimodal_input
+                    )
+                elif self.is_evs_style_video_pruning:
                     video_embeddings = self._postprocess_video_embeds_evs(
                         video_embeddings, multimodal_input
                     )

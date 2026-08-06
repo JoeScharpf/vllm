@@ -394,6 +394,7 @@ class ModelConfig:
     skip_mm_profiling: InitVar[bool | None] = None
     video_pruning_rate: InitVar[float | None] = None
     video_pruning_method: InitVar[str | None] = None
+    nprune_stride: InitVar[int | None] = None
     mm_tensor_ipc: InitVar[MMTensorIPC] = None
     mm_ipc_gpu_memory_gb: InitVar[float | None] = None
     mm_processor_device: InitVar[MMProcessorDevice | None] = None
@@ -525,6 +526,7 @@ class ModelConfig:
         skip_mm_profiling: bool | None,
         video_pruning_rate: float | None,
         video_pruning_method: str | None,
+        nprune_stride: int | None,
         mm_tensor_ipc: MMTensorIPC,
         mm_ipc_gpu_memory_gb: float | None,
         mm_processor_device: MMProcessorDevice | None,
@@ -791,6 +793,7 @@ class ModelConfig:
                 skip_mm_profiling=skip_mm_profiling,
                 video_pruning_rate=video_pruning_rate,
                 video_pruning_method=video_pruning_method,
+                nprune_stride=nprune_stride,
                 mm_tensor_ipc=mm_tensor_ipc,
                 mm_ipc_gpu_memory_gb=mm_ipc_gpu_memory_gb,
             )

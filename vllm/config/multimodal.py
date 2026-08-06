@@ -66,7 +66,7 @@ class MultiModalDummyOptionsBuiltins(TypedDict, total=False):
 
 MMEncoderTPMode = Literal["weights", "data"]
 MMCacheType = Literal["shm", "lru"]
-VideoPruningMethod = Literal["evs", "vidcom2"]
+VideoPruningMethod = Literal["evs", "vidcom2", "nprune", "checkered"]
 MMTensorIPC = Literal["direct_rpc", "torch_shm"]
 MMHasherAlgorithm = Literal["blake3", "sha256", "sha512"]
 MMProcessorDevice: TypeAlias = str
@@ -225,7 +225,14 @@ class MultiModalConfig:
     """Video token pruning algorithm applied when `video_pruning_rate` > 0:
     - "evs": Efficient Video Sampling.
     - "vidcom2": Video Compression Commander.
+    - "nprune": Uniform spatial lattice (stride via `nprune_stride`).
+    - "checkered": Deterministic checkerboard (~50% keep per frame).
+
+    For ``nprune`` / ``checkered`` the rate only enables pruning (must be
+    ``> 0``); keep counts come from the spatial pattern, not from ``rate``.
     """
+    nprune_stride: int = Field(default=2, ge=1, le=4)
+    """Lattice stride for ``video_pruning_method=nprune`` (2 ≈ 25% keep)."""
     mm_tensor_ipc: MMTensorIPC = "direct_rpc"
     """IPC (inter-process communication) method for multimodal tensors.
     - "direct_rpc": Use msgspec serialization via RPC

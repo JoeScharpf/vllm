@@ -10,7 +10,12 @@ from vllm.config import ModelConfig
 from vllm.model_executor.models.cosmos3_edge import Cosmos3EdgeForConditionalGeneration
 from vllm.model_executor.models.interfaces import supports_multimodal_pruning
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.evs import compute_retained_tokens_count
+from vllm.multimodal.video_prune.evs import compute_retained_tokens_count
+from vllm.multimodal.spatial_prune import (
+    checkered_keep_count,
+    nprune_keep_count,
+    spatial_tokens_per_frame,
+)
 
 from ....conftest import ImageTestAssets
 from ...utils import build_model_context
@@ -21,10 +26,19 @@ VIDEO_PLACEHOLDER = "<|vision_start|><|video_pad|><|vision_end|>"
 LOCAL_MODEL_PATH = os.getenv("COSMOS3_EDGE_MODEL_PATH")
 
 
-def _make_processor(*, video_pruning_rate: float | None = None):
+def _make_processor(
+    *,
+    video_pruning_rate: float | None = None,
+    video_pruning_method: str | None = None,
+    nprune_stride: int | None = None,
+):
     kwargs = {}
     if video_pruning_rate is not None:
         kwargs["video_pruning_rate"] = video_pruning_rate
+    if video_pruning_method is not None:
+        kwargs["video_pruning_method"] = video_pruning_method
+    if nprune_stride is not None:
+        kwargs["nprune_stride"] = nprune_stride
 
     if LOCAL_MODEL_PATH:
         model_config = ModelConfig(
@@ -166,3 +180,55 @@ def test_process_video_with_evs(video_pruning_rate: float) -> None:
 
     assert actual_video_tokens == expected_kept
     assert actual_video_tokens < full_tokens
+
+
+@pytest.mark.parametrize(
+    "method,stride",
+    [
+        ("checkered", None),
+        ("nprune", 2),
+    ],
+)
+def test_process_video_with_spatial_prune(
+    method: str, stride: int | None
+) -> None:
+    """NPrune / Checkered should shrink per-frame video tokens uniformly."""
+    processor = _make_processor(
+        video_pruning_rate=0.5,
+        video_pruning_method=method,
+        nprune_stride=stride,
+    )
+    video_asset = VideoAsset(name="baby_reading", num_frames=8)
+    video = (video_asset.np_ndarrays, video_asset.metadata)
+    processed = processor(
+        VIDEO_PLACEHOLDER,
+        mm_items=processor.info.parse_mm_data({"video": [video]}),
+        hf_processor_mm_kwargs={},
+    )
+
+    mm_data = processed["mm_kwargs"].get_data()
+    grid_thw = mm_data["video_grid_thw"]
+    merge_size = processor.info.get_hf_config().vision_config.spatial_merge_size
+    tokens_per_frame = int(grid_thw[0, 1:].prod()) // merge_size**2
+    num_frames = int(grid_thw[0, 0])
+    grid_h = int(grid_thw[0, 1]) // merge_size
+    grid_w = int(grid_thw[0, 2]) // merge_size
+
+    keep = spatial_tokens_per_frame(
+        method,
+        tokens_per_frame,
+        grid_h,
+        grid_w,
+        nprune_stride=stride or 2,
+    )
+    expected = keep * num_frames
+    full_tokens = tokens_per_frame * num_frames
+    video_token_id = processor.info.get_hf_config().video_token_id
+    actual = processed["prompt_token_ids"].count(video_token_id)
+
+    assert actual == expected
+    assert actual < full_tokens
+    if method == "checkered":
+        assert keep == checkered_keep_count(tokens_per_frame)
+    else:
+        assert keep == nprune_keep_count(grid_h, grid_w, stride or 2)
