@@ -391,9 +391,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=None,
         description=(
             "Selection method for token_pruning: 'hiprune' (default), "
-            "'hydart', 'hiprune_pp', 'dart', 'nprune', 'checkered' or "
-            "'anchorprune'. Per-request — the same running server can "
-            "serve different methods. Shorthand for "
+            "'hydart', 'hiprune_pp', 'dart', 'nprune', 'checkered', "
+            "'anchorprune' or 'random'. Per-request — the same running "
+            "server can serve different methods. Shorthand for "
             "mm_processor_kwargs={'hiprune_method': ...}. Omitted: the "
             "server's HIPRUNE_METHOD env var (default 'hiprune')."
         ),
@@ -1038,6 +1038,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "k_min": "hiprune_anchor_kmin",
                     "tau": "hiprune_tau",
                     "return_vision_attention": "hiprune_return_vision_attention",
+                    "random_seed": "hiprune_random_seed",
                 }
                 unknown = set(self.token_pruning_params) - set(param_to_mm_key)
                 if unknown:
